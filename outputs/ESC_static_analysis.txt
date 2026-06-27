@@ -1,0 +1,140 @@
+Статический разбор ESC.exe
+
+Файл:
+C:\Program Files (x86)\ESC\ESC.exe
+
+Что это за приложение
+
+ESC.exe - маленький launcher, рядом лежит Python 3.8 runtime:
+- python38.dll
+- python3.dll
+- lib\library.zip
+
+Основная логика лежит в:
+- C:\Program Files (x86)\ESC\lib\library.zip
+- C:\Program Files (x86)\ESC\lib\Starter
+
+Важные файлы:
+- library.zip\ip_address_network.pyc
+- library.zip\starter.pyc
+- library.zip\esc__main__.pyc
+- lib\Starter\StarterLib.dll
+- lib\Starter\Cameras.dll
+- lib\Starter\NvdcNetSDK.dll
+- lib\Starter\RSNet.dll
+
+Главный вывод
+
+Утилита не использует один общий API для всех камер.
+Она делит камеры по производителю/типу:
+
+- uv - UNV, использует LAPI v1
+- sn - Sunell, использует CGI
+- dc - DynaColor/другой SDK-путь через StarterLib + Cameras.dll + NvdcNetSDK.dll
+
+Поэтому если LAPI v1 работает на старой/одной камере, это не значит, что он подойдет для всего пула.
+
+UNV / LAPI
+
+Функция:
+ip_address_network.pyc -> setup_ip_address_unv
+
+Команда смены IP:
+PUT http://<current_ip>/LAPI/V1.0/Network/Interfaces
+
+Digest-авторизация:
+requests.put(..., auth=HTTPDigestAuth(login, password))
+
+Поля из кода:
+- eth0
+- Netmask: 255.255.255.0
+- Gateway: 192.168.15.1
+
+Получение информации:
+GET http://<ip>/LAPI/V1.0/System/DeviceInfo
+GET http://<ip>/LAPI/V1.0/Network/Interfaces
+
+Sunell / CGI
+
+Функция:
+ip_address_network.pyc -> setup_ip_address_sunell
+
+Команда смены IP:
+GET http://<current_ip>/cgi-bin/param.cgi?userName=Admin&password=1234&action=set&type=localNetwork&netCardId=1&IPProtoVer=1&IPAddress=<new_ip>&subNetmask=255.255.255.0&subGetway=192.168.15.1&preferredDNS=128.0.0.1&alternateDNS=128.0.0.2
+
+После смены IP утилита перезапускает камеру:
+GET http://<current_ip>/cgi-bin/operate.cgi?userName=Admin&password=1234&action=restart
+
+Получение информации:
+GET http://<ip>/cgi-bin/param.cgi?userName=Admin&password=1234&action=get&type=deviceInfo
+GET http://<ip>/cgi-bin/param.cgi?userName=Admin&password=1234&action=get&type=localNetwork&IPProtoVer=1&netCardId=1
+
+DynaColor / SDK
+
+Функция:
+starter.pyc -> setup_ip_address_dc
+
+Она вызывает:
+StarterLib.Class1.ChangingNetSettings(new_ip, mask, gate, dns, port, model, host_name, mac)
+
+dns внутри задается как:
+0.0.0.0
+
+Дальше используется .NET/SDK:
+- Cameras.dll
+- NvdcNetSDK.dll
+- RSNet.dll
+
+В строках DLL найдены важные имена:
+- ChangingNetSettings
+- GetDeviceInformation
+- GetNetworkInterfaces
+- SetNetworkInterfaces
+- RSNetSearchDev
+- RSNetSetParam
+- CMS_DeviceModifyer_SetHostNetwork
+- ST_HostNetworkParam
+- szLocalIp
+- szLocalSubnetMask
+- szGateway
+- szPrimaryDNSIp
+- szSpareDNSIp
+
+Это похоже не на REST HTTP, а на SDK/низкоуровневый протокол поиска и настройки.
+В папке также есть SharpPcap, PacketDotNet и wpcap.dll, значит утилита может работать через сетевые пакеты/WinPcap.
+
+RTSP
+
+В коде есть пути для Sunell:
+rtsp://<login>:<password>@<ip>:554/snl/live/1/1/bPvJ5dg=-bPvJ5dhs4PXimw==
+rtsp://<login>:<password>@<ip>:554/snl/live/1/1/bPvJ5dg=-HK2XuA==
+
+Что делать дальше
+
+1. Для UNV-камер можно использовать наш LAPI-скрипт.
+2. Для Sunell нужен отдельный CGI-скрипт, не LAPI.
+3. Для dc/DynaColor/SDK-камер лучше завтра снять pcap работы ESC при смене IP.
+
+Что пикать завтра в Wireshark
+
+Для точного повторения команды:
+1. Запустить Wireshark.
+2. Запустить ESC.
+3. Найти камеру в ESC.
+4. Сменить IP через ESC.
+5. Сохранить pcap.
+
+Фильтры, которые потом полезно смотреть:
+- ip.addr == 192.168.0.250
+- udp
+- tcp
+- http
+- arp
+
+Особенно важны пакеты до/после нажатия "сменить IP".
+
+Ограничение текущего разбора
+
+Я не запускал ESC.exe и не подключался к камерам.
+Разбор сделан статически по строкам, PDB и Python bytecode.
+Для SDK-пути без pcap или полноценного decompile Cameras.dll/NvdcNetSDK.dll точный формат пакета пока не восстановлен.
