@@ -57,6 +57,17 @@ def iter_input_csv(path: pathlib.Path):
                 yield ip
 
 
+def parse_credential(value: str) -> tuple[str, str]:
+    if ":" not in value:
+        raise argparse.ArgumentTypeError("Use username:password, for example Admin:password")
+    username, password = value.split(":", 1)
+    username = username.strip()
+    password = password.strip()
+    if not username:
+        raise argparse.ArgumentTypeError("Credential username is empty.")
+    return username, password
+
+
 def build_digest_opener(url: str, username: str, password: str):
     password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
     password_manager.add_password(None, url, username, password)
@@ -132,12 +143,19 @@ def compact_json(data) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
-def collect_one(ip: str, args: argparse.Namespace, password: str) -> dict:
+def first_nonempty(*values):
+    for value in values:
+        if value not in ("", None, "null"):
+            return value
+    return ""
+
+
+def collect_one_with_credential(ip: str, args: argparse.Namespace, username: str, password: str) -> dict:
     info = {}
     if args.api in ("auto", "unv"):
         for name, path in ENDPOINTS.items():
             try:
-                info[name] = http_json_get(ip, args.username, password, args.http_timeout, path)
+                info[name] = http_json_get(ip, username, password, args.http_timeout, path)
                 print(f"{ip}: read {path}")
             except NETWORK_ERRORS as exc:
                 info[name] = {"error": str(exc)}
@@ -148,7 +166,7 @@ def collect_one(ip: str, args: argparse.Namespace, password: str) -> dict:
         info = {}
         for name, info_type in {"device_info": "deviceInfo", "network_interfaces": "localNetwork"}.items():
             try:
-                info[name] = sunell_cgi_get(ip, args.username, password, args.http_timeout, info_type)
+                info[name] = sunell_cgi_get(ip, username, password, args.http_timeout, info_type)
                 print(f"{ip}: read Sunell {info_type}")
             except NETWORK_ERRORS as exc:
                 info[name] = {"error": str(exc)}
@@ -159,28 +177,38 @@ def collect_one(ip: str, args: argparse.Namespace, password: str) -> dict:
     return {
         "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
         "ip": ip,
-        "model": find_first(device_info, {"model", "devicemodel", "modelname", "productmodel", "devicetype"}),
+        "model": find_first(device_info, {"model", "devicemodel", "modelname", "productmodel", "prototypename"}),
         "serial_number": find_first(
             device_info,
-            {
-                "sn",
-                "serial",
-                "serialno",
-                "serialnum",
-                "serialnumber",
-                "devicesn",
-                "deviceserialno",
-                "serialid",
-            },
+            {"sn", "serial", "serialno", "serialnum", "serialnumber", "devicesn", "deviceserialno", "serialid"},
         ),
-        "mac": find_first(network_info, {"mac", "macaddress", "physicaladdress", "hwaddr"}),
-        "firmware": find_first(
-            device_info,
-            {"firmware", "firmwareversion", "softwareversion", "swversion", "version"},
+        "device_id": find_first(device_info, {"deviceid", "id"}),
+        "manufacturer": find_first(device_info, {"manufacturer", "manufacturername", "manufacturerid"}),
+        "mac": first_nonempty(
+            find_first(network_info, {"mac", "macaddress", "physicaladdress", "hwaddr"}),
+            find_first(device_info, {"mac", "macaddress", "physicaladdress", "hwaddr"}),
         ),
+        "firmware": find_first(device_info, {"firmware", "firmwareversion", "softwareversion", "swversion", "version"}),
+        "netmask": find_first(network_info, {"netmask", "subnetmask", "subnet"}),
         "device_info_json": compact_json(device_info),
         "network_json": compact_json(network_info),
     }
+
+
+def has_inventory_data(row: dict) -> bool:
+    return any(row.get(name) for name in ("model", "serial_number", "mac", "device_id"))
+
+
+def collect_one(ip: str, args: argparse.Namespace, credentials: list[tuple[str, str]]) -> dict:
+    last_row = {}
+    for username, password in credentials:
+        print(f"{ip}: trying inventory as {username}")
+        row = collect_one_with_credential(ip, args, username, password)
+        row["username"] = username
+        last_row = row
+        if has_inventory_data(row):
+            return row
+    return last_row
 
 
 def parse_args() -> argparse.Namespace:
@@ -190,6 +218,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-ip", default=None)
     parser.add_argument("--input-csv", default=None, help="CSV with assigned_ip column.")
     parser.add_argument("--output-csv", default=str(script_dir / "camera_info_after.csv"))
+    parser.add_argument("--credential", action="append", type=parse_credential, default=None)
     parser.add_argument("--username", default="Admin")
     parser.add_argument("--password", default=None)
     parser.add_argument("--ping-timeout-ms", type=int, default=700)
@@ -213,26 +242,34 @@ def main() -> int:
     else:
         raise SystemExit("Use either --input-csv or both --start-ip and --end-ip.")
 
-    password = args.password
-    if password is None:
-        password = getpass.getpass(f"Password for {args.username}: ")
+    credentials = args.credential
+    if not credentials:
+        password = args.password
+        if password is None:
+            password = getpass.getpass(f"Password for {args.username}: ")
+        credentials = [(args.username, password)]
+    print("Credentials to try: " + ", ".join(username for username, _ in credentials))
 
     rows = []
     for ip in ips:
         if not args.skip_ping and not ping(ip, args.ping_timeout_ms):
             print(f"{ip}: no ping reply, skipped")
             continue
-        rows.append(collect_one(ip, args, password))
+        rows.append(collect_one(ip, args, credentials))
 
     output_path = pathlib.Path(args.output_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "timestamp",
         "ip",
+        "username",
         "model",
         "serial_number",
+        "device_id",
+        "manufacturer",
         "mac",
         "firmware",
+        "netmask",
         "device_info_json",
         "network_json",
     ]

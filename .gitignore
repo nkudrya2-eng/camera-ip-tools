@@ -10,3 +10,14 @@ outputs/esc_disasm/
 outputs/*.csv
 *.pcap
 *.pcapng
+outputs/camera_gallery*.html
+outputs/camera_pnr_report*.md
+outputs/camera_pnr_report*.docx
+outputs/camera_pnr_report*.pdf
+outputs/camera_checklists_from_template.docx
+outputs/camera_gallery_assets/
+outputs/check_docx_render/
+outputs/tmp/
+outputs/camera_credentials_notes.txt
+outputs/PF Din Text Cond Pro.ttf
+outputs/camera-pdf-fonts.css

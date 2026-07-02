@@ -232,6 +232,45 @@ def network_interface_is_supported(info: dict) -> bool:
     return False
 
 
+def sunell_network_interface_is_supported(info: dict) -> bool:
+    network_info = info.get("network_interfaces", {})
+    if isinstance(network_info, dict) and "error" not in network_info:
+        return True
+    reason = network_info.get("error") if isinstance(network_info, dict) else "unknown error"
+    print(f"Sunell network API is not available: {reason}")
+    return False
+
+
+def prepare_http_attempt(args: argparse.Namespace, attempt: int) -> None:
+    if attempt > 1:
+        print(f"Retrying camera API after ARP reset, attempt {attempt}/{args.api_retries}...")
+    if flush_arp(args.camera_ip):
+        print(f"ARP cache entry for {args.camera_ip} cleared before API check")
+    else:
+        print("Could not clear ARP cache before API check. Run the terminal as Administrator.")
+    time.sleep(args.api_retry_seconds)
+
+
+def collect_lapi_until_supported(args: argparse.Namespace, password: str) -> tuple[dict, bool]:
+    info = {}
+    for attempt in range(1, args.api_retries + 1):
+        prepare_http_attempt(args, attempt)
+        info = collect_camera_info(args, password)
+        if network_interface_is_supported(info):
+            return info, True
+    return info, False
+
+
+def collect_sunell_until_supported(args: argparse.Namespace, password: str) -> tuple[dict, bool]:
+    info = {}
+    for attempt in range(1, args.api_retries + 1):
+        prepare_http_attempt(args, attempt)
+        info = collect_sunell_camera_info(args, password)
+        if sunell_network_interface_is_supported(info):
+            return info, True
+    return info, False
+
+
 def append_inventory_log(args: argparse.Namespace, new_ip: str, info: dict) -> None:
     log_path = pathlib.Path(args.log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -393,6 +432,80 @@ def send_sunell_network_command(args: argparse.Namespace, password: str, new_ip:
     return True
 
 
+def sunell_response_ok(text: str) -> bool:
+    lower = text.lower()
+    return "error" not in lower and "return=-" not in lower
+
+
+def send_sunell_ntp_command(args: argparse.Namespace, password: str) -> bool:
+    set_params = {
+        "userName": args.username,
+        "password": password,
+        "action": "set",
+        "type": "NTP",
+        "enableFlag": "1",
+        "IPProtoVer": "1",
+        "NTPIP": args.ntp_server,
+        "NTPPort": str(args.ntp_port),
+        "NTPCheckTime": str(args.ntp_interval_minutes * 60),
+    }
+    set_url = f"http://{args.camera_ip}/cgi-bin/param.cgi?{urllib.parse.urlencode(set_params)}"
+    print(f"Writing NTP {args.ntp_server}:{args.ntp_port} to Sunell camera at {args.camera_ip}")
+
+    if args.dry_run:
+        safe_params = dict(set_params)
+        safe_params["password"] = "***"
+        print("DRY RUN: would call:")
+        print(f"http://{args.camera_ip}/cgi-bin/param.cgi?{urllib.parse.urlencode(safe_params)}")
+        return True
+
+    with urllib.request.urlopen(set_url, timeout=args.http_timeout) as response:
+        response_text = response.read().decode("utf-8", errors="replace")
+        print(f"NTP HTTP {response.status}: {response_text.strip()}")
+        return response.status == 200 and sunell_response_ok(response_text)
+
+
+def make_lapi_ntp_payload(args: argparse.Namespace) -> dict:
+    return {
+        "Enabled": True,
+        "NTPServer": args.ntp_server,
+        "NTPPort": args.ntp_port,
+        "Interval": args.ntp_interval_minutes,
+    }
+
+
+def send_lapi_ntp_command(args: argparse.Namespace, password: str) -> bool:
+    url = f"http://{args.camera_ip}/LAPI/V1.0/Network/NTP"
+    payload = make_lapi_ntp_payload(args)
+    print(f"Writing NTP {args.ntp_server}:{args.ntp_port} to LAPI camera at {args.camera_ip}")
+
+    if args.dry_run:
+        print("DRY RUN: would send:")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return True
+
+    opener = build_digest_opener(url, args.username, password)
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
+
+    with opener.open(request, timeout=args.http_timeout) as response:
+        response_text = response.read().decode("utf-8", errors="replace")
+        print(f"NTP HTTP {response.status}: {response_text.strip()}")
+        return response.status == 200 and response_succeeded(response_text)
+
+
+def send_ntp_command(args: argparse.Namespace, password: str, api: str) -> bool:
+    if args.no_ntp:
+        return True
+    if api == "sunell":
+        return send_sunell_ntp_command(args, password)
+    return send_lapi_ntp_command(args, password)
+
+
 def send_camera_command(args: argparse.Namespace, password: str, new_ip: str, api: str) -> bool:
     if api == "sunell":
         return send_sunell_network_command(args, password, new_ip)
@@ -455,11 +568,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gateway", default="192.168.15.1")
     parser.add_argument("--primary-dns", default="128.0.0.1")
     parser.add_argument("--secondary-dns", default="128.0.0.2")
+    parser.add_argument("--ntp-server", default="10.53.240.12")
+    parser.add_argument("--ntp-port", type=int, default=123)
+    parser.add_argument("--ntp-interval-minutes", type=int, default=60)
+    parser.add_argument("--no-ntp", action="store_true", help="Do not write NTP settings before changing IP.")
     parser.add_argument("--username", default="admin")
     parser.add_argument("--password", default=None)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     parser.add_argument("--ping-timeout-ms", type=int, default=700)
     parser.add_argument("--http-timeout", type=float, default=5.0)
+    parser.add_argument("--api-retries", type=int, default=3)
+    parser.add_argument("--api-retry-seconds", type=float, default=1.0)
     parser.add_argument(
         "--log-file",
         default=str(pathlib.Path(__file__).with_name("camera_inventory.csv")),
@@ -525,21 +644,33 @@ def main() -> int:
 
         api = args.api
         if not args.dry_run and args.api == "sunell":
-            info = collect_sunell_camera_info(args, password or "")
+            info, supported = collect_sunell_until_supported(args, password or "")
             append_inventory_log(args, new_ip, info)
+            if not supported:
+                print("Command failed; Sunell API is not available after ARP retries.")
+                return 1
         elif not args.dry_run:
-            info = collect_camera_info(args, password or "")
-            if not network_interface_is_supported(info):
+            info, supported = collect_lapi_until_supported(args, password or "")
+            if not supported:
                 if args.api == "unv":
                     append_inventory_log(args, new_ip, info)
                     print("Command failed; camera does not support the network interface API.")
                     return 1
                 print("LAPI is not available; trying Sunell CGI.")
                 api = "sunell"
-                info = collect_sunell_camera_info(args, password or "")
+                info, supported = collect_sunell_until_supported(args, password or "")
+                if not supported:
+                    append_inventory_log(args, new_ip, info)
+                    print("Command failed; unknown camera API. Need packet capture or vendor utility protocol.")
+                    return 1
             append_inventory_log(args, new_ip, info)
 
         try:
+            try:
+                if not send_ntp_command(args, password or "", api):
+                    print("NTP command failed; continuing with IP change.")
+            except NETWORK_ERRORS as exc:
+                print(f"NTP request failed: {exc}; continuing with IP change.", file=sys.stderr)
             ok = send_camera_command(args, password or "", new_ip, api)
         except NETWORK_ERRORS as exc:
             print(f"Request failed: {exc}", file=sys.stderr)
