@@ -4,12 +4,19 @@ import datetime as dt
 import getpass
 import http.client
 import ipaddress
-import json
 import pathlib
 import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from probe_onvif_time import (
+    compact_fault as onvif_compact_fault,
+    onvif_post,
+    parse_ntp as onvif_parse_ntp,
+    parse_system_time as onvif_parse_system_time,
+)
+from set_onvif_time import offset_to_onvif_tz, set_ntp_xml, set_system_time_xml
 
 
 NETWORK_ERRORS = (
@@ -64,113 +71,6 @@ def parse_credential(value: str) -> tuple[str, str]:
     return username, password
 
 
-def build_digest_opener(url: str, username: str, password: str):
-    password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-    password_manager.add_password(None, url, username, password)
-    return urllib.request.build_opener(
-        urllib.request.HTTPDigestAuthHandler(password_manager),
-        urllib.request.HTTPBasicAuthHandler(password_manager),
-    )
-
-
-def lapi_get(ip: str, username: str, password: str, timeout: float, path: str) -> dict:
-    url = f"http://{ip}{path}"
-    opener = build_digest_opener(url, username, password)
-    request = urllib.request.Request(url, method="GET")
-    with opener.open(request, timeout=timeout) as response:
-        text = response.read().decode("utf-8", errors="replace")
-        return json.loads(text)
-
-
-def lapi_put(ip: str, username: str, password: str, timeout: float, path: str, payload: dict) -> tuple[bool, str]:
-    url = f"http://{ip}{path}"
-    opener = build_digest_opener(url, username, password)
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        method="PUT",
-        headers={"Content-Type": "application/json"},
-    )
-    with opener.open(request, timeout=timeout) as response:
-        text = response.read().decode("utf-8", errors="replace")
-        return lapi_success(text), text
-
-
-def lapi_success(text: str) -> bool:
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return "Succeed" in text
-    response = data.get("Response", {})
-    return (
-        response.get("ResponseCode") == 0
-        or response.get("ResponseString") == "Succeed"
-        or response.get("StatusString") == "Succeed"
-    )
-
-
-def response_data(response: dict):
-    if isinstance(response, dict) and isinstance(response.get("Response"), dict):
-        return response["Response"].get("Data", response)
-    return response
-
-
-def patch_ntp_value(data, ntp_server: str, timezone: str, interval: int) -> bool:
-    changed = False
-    if isinstance(data, dict):
-        for key, value in list(data.items()):
-            low = key.lower()
-            if low in {"enabled", "enable", "ntpenable", "ntpenabled", "enabledntp"}:
-                data[key] = 1 if isinstance(value, int) else True
-                changed = True
-            elif low in {"mode", "synctype", "timesyncmode"} and isinstance(value, (str, int)):
-                data[key] = "NTP" if isinstance(value, str) else value
-                changed = True
-            elif "server" in low and "ntp" in low:
-                data[key] = ntp_server
-                changed = True
-            elif low in {"server", "address", "ipaddress", "host", "hostname"} and isinstance(value, str):
-                data[key] = ntp_server
-                changed = True
-            elif "interval" in low and isinstance(value, int):
-                data[key] = interval
-                changed = True
-            elif "timezone" in low or low in {"tz", "time_zone"}:
-                data[key] = timezone
-                changed = True
-            else:
-                changed = patch_ntp_value(value, ntp_server, timezone, interval) or changed
-    elif isinstance(data, list):
-        for item in data:
-            changed = patch_ntp_value(item, ntp_server, timezone, interval) or changed
-    return changed
-
-
-def make_lapi_payload(original: dict, ntp_server: str, timezone: str, interval: int) -> dict:
-    payload = json.loads(json.dumps(original))
-    data = response_data(payload)
-    changed = patch_ntp_value(data, ntp_server, timezone, interval)
-    if not changed and isinstance(data, dict):
-        data.update(
-            {
-                "Enabled": True,
-                "NTPServer": ntp_server,
-                "Interval": interval,
-                "TimeZone": timezone,
-            }
-        )
-    return data if isinstance(data, dict) else payload
-
-
-def sync_lapi(ip: str, username: str, password: str, args: argparse.Namespace) -> tuple[bool, str]:
-    current = lapi_get(ip, username, password, args.http_timeout, "/LAPI/V1.0/Network/NTP")
-    payload = make_lapi_payload(current, args.ntp_server, args.timezone, args.interval)
-    if args.dry_run:
-        return True, "dry-run LAPI payload: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    ok, text = lapi_put(ip, username, password, args.http_timeout, "/LAPI/V1.0/Network/NTP", payload)
-    return ok, text[:500]
-
-
 def sunell_get(ip: str, username: str, password: str, timeout: float, info_type: str) -> str:
     params = {"userName": username, "password": password, "action": "get", "type": info_type}
     url = f"http://{ip}/cgi-bin/param.cgi?{urllib.parse.urlencode(params)}"
@@ -190,6 +90,98 @@ def sunell_set(ip: str, username: str, password: str, timeout: float, params: di
 def sunell_response_ok(text: str) -> bool:
     lower = text.lower()
     return "error" not in lower and "return=-" not in lower
+
+
+def is_account_locked(message: str) -> bool:
+    lower = message.lower()
+    return "userlocked" in lower or "statuscode\": 364" in lower or "account locked" in lower
+
+
+def onvif_write(ip: str, username: str, password: str, args: argparse.Namespace, action: str, body_xml: str) -> tuple[str, str]:
+    try:
+        root = onvif_post(ip, args.onvif_path, username, password, args.http_timeout, action, body_xml)
+    except NETWORK_ERRORS as exc:
+        return "failed", str(exc)
+    except Exception as exc:
+        return "failed", f"{type(exc).__name__}: {exc}"
+
+    fault = onvif_compact_fault(root)
+    if fault:
+        return "failed", fault
+    return "ok", "OK"
+
+
+def onvif_probe_after(ip: str, username: str, password: str, args: argparse.Namespace) -> tuple[str, str, str, str]:
+    errors = []
+    timezone = ""
+    utc_time = ""
+    ntp = ""
+    try:
+        time_root = onvif_post(
+            ip,
+            args.onvif_path,
+            username,
+            password,
+            args.http_timeout,
+            "GetSystemDateAndTime",
+            "<tds:GetSystemDateAndTime/>",
+        )
+        time_data = onvif_parse_system_time(time_root)
+        timezone = time_data.get("timezone", "")
+        utc_time = time_data.get("utc_time", "")
+    except NETWORK_ERRORS as exc:
+        errors.append(f"GetSystemDateAndTime: {exc}")
+
+    try:
+        ntp_root = onvif_post(ip, args.onvif_path, username, password, args.http_timeout, "GetNTP", "<tds:GetNTP/>")
+        ntp = onvif_parse_ntp(ntp_root)
+    except NETWORK_ERRORS as exc:
+        errors.append(f"GetNTP: {exc}")
+
+    return timezone, utc_time, ntp, "; ".join(errors)
+
+
+def sync_onvif(ip: str, username: str, password: str, args: argparse.Namespace) -> tuple[bool, str]:
+    timezone_onvif = args.timezone_onvif or offset_to_onvif_tz(args.timezone)
+    if args.dry_run:
+        return True, f"dry-run ONVIF NTP={args.ntp_server}, timezone={timezone_onvif}"
+
+    messages = []
+    ntp_write, message = onvif_write(
+        ip,
+        username,
+        password,
+        args,
+        "SetNTP",
+        set_ntp_xml(args.ntp_server, args.from_dhcp),
+    )
+    if ntp_write != "ok":
+        messages.append("SetNTP: " + message)
+
+    timezone_write, message = onvif_write(
+        ip,
+        username,
+        password,
+        args,
+        "SetSystemDateAndTime",
+        set_system_time_xml(timezone_onvif, args.daylight_savings),
+    )
+    if timezone_write != "ok":
+        messages.append("SetSystemDateAndTime: " + message)
+
+    timezone_after, utc_after, ntp_after, verify_errors = onvif_probe_after(ip, username, password, args)
+    timezone_ok = timezone_after == timezone_onvif
+    ntp_ok = args.ntp_server in ntp_after
+    if timezone_ok and ntp_ok:
+        return True, f"ONVIF target verified; timezone={timezone_after}; ntp={ntp_after}; utc={utc_after}"
+
+    if verify_errors:
+        messages.append("verify: " + verify_errors)
+    if not timezone_ok:
+        messages.append(f"timezone after is {timezone_after or '<empty>'}, expected {timezone_onvif}")
+    if not ntp_ok:
+        messages.append(f"NTP after is {ntp_after or '<empty>'}, expected {args.ntp_server}")
+    return False, "; ".join(messages) if messages else "ONVIF target not verified"
 
 
 def sunell_probe(ip: str, username: str, password: str, args: argparse.Namespace) -> str:
@@ -318,26 +310,46 @@ def sync_one(ip: str, credentials: list[tuple[str, str]], args: argparse.Namespa
         return row
 
     for username, password in credentials:
-        print(f"{ip}: trying as {username}")
+        if args.verbose:
+            print(f"{ip}: trying as {username}")
         if args.probe_only:
             row.update({"api": "probe", "username": username, "message": sunell_probe(ip, username, password, args)})
             return row
-        apis = ("lapi", "sunell") if args.api == "auto" else (args.api,)
+        apis = ("onvif", "sunell") if args.api == "auto" else (args.api,)
         for api in apis:
             try:
-                ok, message = sync_lapi(ip, username, password, args) if api == "lapi" else sync_sunell(ip, username, password, args)
+                if api == "onvif":
+                    ok, message = sync_onvif(ip, username, password, args)
+                else:
+                    ok, message = sync_sunell(ip, username, password, args)
                 row.update({"api": api, "username": username, "message": message})
                 if ok:
                     row["ok"] = "1"
                     print(f"{ip}: time sync OK by {api}")
                     return row
-                print(f"{ip}: {api} failed: {message}")
+                if args.verbose:
+                    print(f"{ip}: {api} failed: {message}")
+                if is_account_locked(message):
+                    row["message"] = "account locked; stop retries for this IP"
+                    print(f"{ip}: account locked; stop retries for this IP")
+                    return row
             except NETWORK_ERRORS as exc:
                 row.update({"api": api, "username": username, "message": str(exc)})
-                print(f"{ip}: {api} failed: {exc}")
+                if args.verbose:
+                    print(f"{ip}: {api} failed: {exc}")
+                if is_account_locked(str(exc)):
+                    row["message"] = "account locked; stop retries for this IP"
+                    print(f"{ip}: account locked; stop retries for this IP")
+                    return row
             except Exception as exc:
                 row.update({"api": api, "username": username, "message": f"{type(exc).__name__}: {exc}"})
-                print(f"{ip}: {api} failed: {type(exc).__name__}: {exc}")
+                if args.verbose:
+                    print(f"{ip}: {api} failed: {type(exc).__name__}: {exc}")
+                if is_account_locked(str(exc)):
+                    row["message"] = "account locked; stop retries for this IP"
+                    print(f"{ip}: account locked; stop retries for this IP")
+                    return row
+    print(f"{ip}: FAILED {row['api'] or 'none'} {row['message']}")
     return row
 
 
@@ -347,17 +359,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-ip", default="10.53.240.30")
     parser.add_argument("--end-ip", default="10.53.240.132")
     parser.add_argument("--ip-list", default="", help="Comma-separated IP list; overrides --start-ip/--end-ip.")
-    parser.add_argument("--ntp-server", default="10.53.240.12")
+    parser.add_argument("--ntp-server", default="10.99.200.60")
     parser.add_argument("--timezone", default="+08:00")
     parser.add_argument("--interval", type=int, default=60)
     parser.add_argument("--credential", action="append", type=parse_credential, default=None)
     parser.add_argument("--username", default="Admin")
     parser.add_argument("--password", default=None)
-    parser.add_argument("--api", choices=("auto", "lapi", "sunell"), default="auto")
+    parser.add_argument("--api", choices=("auto", "onvif", "sunell"), default="auto")
+    parser.add_argument("--onvif-path", default="/onvif/device_service")
+    parser.add_argument("--timezone-onvif", default="", help="Explicit ONVIF TZ, for example UTC-08:00:00.")
+    parser.add_argument("--from-dhcp", action="store_true", help="Use ONVIF NTP from DHCP instead of manual NTP.")
+    parser.add_argument("--daylight-savings", action="store_true")
     parser.add_argument("--ping-timeout-ms", type=int, default=700)
     parser.add_argument("--http-timeout", type=float, default=5.0)
     parser.add_argument("--skip-ping", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--verbose", action="store_true", help="Print every failed API attempt, not only final result.")
     parser.add_argument("--probe-only", action="store_true", help="Only read likely Sunell time sections; do not change settings.")
     parser.add_argument("--output-csv", default=str(script_dir / "time_sync_results.csv"))
     return parser.parse_args()
