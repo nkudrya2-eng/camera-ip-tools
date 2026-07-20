@@ -1,6 +1,11 @@
 .agents/
 .codex/
 work/
+.codex-remote-attachments/
+tmp/
+
+AutoStartSettingWork_v0.02/.venv/
+AutoStartSettingWork_v0.02/__pycache__/
 
 __pycache__/
 *.pyc
@@ -18,6 +23,17 @@ outputs/camera_checklists_from_template.docx
 outputs/camera_gallery_assets/
 outputs/check_docx_render/
 outputs/tmp/
+outputs/.server_install_test/
+outputs/.server_package_test/
+outputs/.zip_content_check/
+outputs/.vscode/
+outputs/1/
+outputs/back/
+outputs/gallery_*/
+outputs/camera_compare_*/
+outputs/camera_241_web/
+outputs/CameraIpTools_WindowsServer_Offline/
+outputs/CameraIpTools_WindowsServer_Offline.zip
 outputs/camera_credentials_notes.txt
 outputs/PF Din Text Cond Pro.ttf
 outputs/camera-pdf-fonts.css

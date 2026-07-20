@@ -97,6 +97,48 @@ def is_account_locked(message: str) -> bool:
     return "userlocked" in lower or "statuscode\": 364" in lower or "account locked" in lower
 
 
+def parse_offset(offset: str) -> tuple[str, int, int]:
+    raw = offset.strip()
+    if not raw or raw[0] not in "+-":
+        raise argparse.ArgumentTypeError("Use timezone like +08:00.")
+    sign = raw[0]
+    parts = raw[1:].split(":")
+    if len(parts) < 2:
+        raise argparse.ArgumentTypeError("Use timezone like +08:00.")
+    hours = int(parts[0])
+    minutes = int(parts[1])
+    if hours > 23 or minutes > 59:
+        raise argparse.ArgumentTypeError("Invalid timezone offset.")
+    return sign, hours, minutes
+
+
+def unique_values(values: list[str]) -> list[str]:
+    result = []
+    for value in values:
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def timezone_candidates(args: argparse.Namespace) -> list[str]:
+    sign, hours, minutes = parse_offset(args.timezone)
+    posix_sign = "-" if sign == "+" else "+"
+    human = f"{sign}{hours:02d}:{minutes:02d}"
+    human_short = f"{sign}{hours}" if minutes == 0 else human
+    posix_short = f"{posix_sign}{hours}" if minutes == 0 else f"{posix_sign}{hours:02d}:{minutes:02d}"
+    candidates = [
+        args.timezone_onvif,
+        offset_to_onvif_tz(args.timezone),
+        f"GMT{human}",
+        f"GMT{human_short}",
+        f"UTC{human}",
+        f"UTC{human_short}",
+        f"GMT{posix_short}",
+        f"CST{posix_short}",
+    ]
+    return unique_values(candidates)
+
+
 def onvif_write(ip: str, username: str, password: str, args: argparse.Namespace, action: str, body_xml: str) -> tuple[str, str]:
     try:
         root = onvif_post(ip, args.onvif_path, username, password, args.http_timeout, action, body_xml)
@@ -142,9 +184,9 @@ def onvif_probe_after(ip: str, username: str, password: str, args: argparse.Name
 
 
 def sync_onvif(ip: str, username: str, password: str, args: argparse.Namespace) -> tuple[bool, str]:
-    timezone_onvif = args.timezone_onvif or offset_to_onvif_tz(args.timezone)
+    candidates = timezone_candidates(args)
     if args.dry_run:
-        return True, f"dry-run ONVIF NTP={args.ntp_server}, timezone={timezone_onvif}"
+        return True, f"dry-run ONVIF NTP={args.ntp_server}, timezone candidates={','.join(candidates)}"
 
     messages = []
     ntp_write, message = onvif_write(
@@ -158,28 +200,36 @@ def sync_onvif(ip: str, username: str, password: str, args: argparse.Namespace) 
     if ntp_write != "ok":
         messages.append("SetNTP: " + message)
 
-    timezone_write, message = onvif_write(
-        ip,
-        username,
-        password,
-        args,
-        "SetSystemDateAndTime",
-        set_system_time_xml(timezone_onvif, args.daylight_savings),
-    )
-    if timezone_write != "ok":
-        messages.append("SetSystemDateAndTime: " + message)
+    timezone_after = ""
+    utc_after = ""
+    ntp_after = ""
+    verify_errors = ""
+    tried_timezones = []
+    for timezone_value in candidates:
+        tried_timezones.append(timezone_value)
+        timezone_write, message = onvif_write(
+            ip,
+            username,
+            password,
+            args,
+            "SetSystemDateAndTime",
+            set_system_time_xml(timezone_value, args.daylight_savings),
+        )
+        if timezone_write != "ok":
+            messages.append(f"SetSystemDateAndTime {timezone_value}: {message}")
+            continue
 
-    timezone_after, utc_after, ntp_after, verify_errors = onvif_probe_after(ip, username, password, args)
-    timezone_ok = timezone_after == timezone_onvif
-    ntp_ok = args.ntp_server in ntp_after
-    if timezone_ok and ntp_ok:
-        return True, f"ONVIF target verified; timezone={timezone_after}; ntp={ntp_after}; utc={utc_after}"
+        timezone_after, utc_after, ntp_after, verify_errors = onvif_probe_after(ip, username, password, args)
+        timezone_ok = timezone_after in candidates
+        ntp_ok = args.ntp_server in ntp_after
+        if timezone_ok and ntp_ok:
+            return True, f"ONVIF target verified; timezone={timezone_after}; ntp={ntp_after}; utc={utc_after}"
 
     if verify_errors:
         messages.append("verify: " + verify_errors)
-    if not timezone_ok:
-        messages.append(f"timezone after is {timezone_after or '<empty>'}, expected {timezone_onvif}")
-    if not ntp_ok:
+    if timezone_after not in candidates:
+        messages.append(f"timezone after is {timezone_after or '<empty>'}, tried {','.join(tried_timezones)}")
+    if args.ntp_server not in ntp_after:
         messages.append(f"NTP after is {ntp_after or '<empty>'}, expected {args.ntp_server}")
     return False, "; ".join(messages) if messages else "ONVIF target not verified"
 
@@ -215,7 +265,7 @@ def sunell_probe(ip: str, username: str, password: str, args: argparse.Namespace
 
 def sync_sunell(ip: str, username: str, password: str, args: argparse.Namespace) -> tuple[bool, str]:
     # Sunell variants differ by firmware; try common names and log the first success.
-    candidates = [
+    ntp_candidates = [
         {
             "type": "NTP",
             "enableFlag": "1",
@@ -232,67 +282,82 @@ def sync_sunell(ip: str, username: str, password: str, args: argparse.Namespace)
             "NTPPort": "123",
             "NTPCheckTime": str(args.interval),
         },
-        {
-            "type": "ntp",
-            "server": args.ntp_server,
-            "enable": "1",
-            "interval": str(args.interval),
-            "timeZone": args.timezone,
-        },
-        {
-            "type": "time",
-            "ntpServer": args.ntp_server,
-            "ntpEnable": "1",
-            "ntpInterval": str(args.interval),
-            "timeZone": args.timezone,
-        },
-        {
-            "type": "dateTime",
-            "ntpServer": args.ntp_server,
-            "ntpEnable": "1",
-            "ntpInterval": str(args.interval),
-            "timeZone": args.timezone,
-        },
-        {
-            "type": "systemTime",
-            "ntpServer": args.ntp_server,
-            "ntpEnable": "1",
-            "ntpInterval": str(args.interval),
-            "timeZone": args.timezone,
-        },
-        {
-            "type": "timeConfig",
-            "ntpServer": args.ntp_server,
-            "ntpEnable": "1",
-            "ntpInterval": str(args.interval),
-            "timeZone": args.timezone,
-        },
-        {
-            "type": "timeSetting",
-            "ntpServer": args.ntp_server,
-            "ntpEnable": "1",
-            "ntpInterval": str(args.interval),
-            "timeZone": args.timezone,
-        },
-        {
-            "type": "ntpConfig",
-            "server": args.ntp_server,
-            "enable": "1",
-            "interval": str(args.interval),
-            "timeZone": args.timezone,
-        },
     ]
+    timezone_types = ["NTP", "ntp", "time", "dateTime", "systemTime", "timeConfig", "timeSetting", "ntpConfig"]
+    timezone_params = []
+    for timezone_value in timezone_candidates(args):
+        for info_type in timezone_types:
+            if info_type == "NTP":
+                timezone_params.append(
+                    {
+                        "type": "NTP",
+                        "enableFlag": "1",
+                        "IPProtoVer": "1",
+                        "NTPIP": args.ntp_server,
+                        "NTPPort": "123",
+                        "NTPCheckTime": str(args.interval * 60),
+                        "timeZone": timezone_value,
+                    }
+                )
+            elif info_type == "ntpConfig":
+                timezone_params.append(
+                    {
+                        "type": "ntpConfig",
+                        "server": args.ntp_server,
+                        "enable": "1",
+                        "interval": str(args.interval),
+                        "timeZone": timezone_value,
+                    }
+                )
+            else:
+                timezone_params.append(
+                    {
+                        "type": info_type,
+                        "ntpServer": args.ntp_server,
+                        "ntpEnable": "1",
+                        "ntpInterval": str(args.interval),
+                        "timeZone": timezone_value,
+                    }
+                )
+
     errors = []
-    for params in candidates:
+    ntp_ok = False
+    ntp_message = ""
+    for params in ntp_candidates:
         try:
             if args.dry_run:
                 return True, "dry-run Sunell params: " + urllib.parse.urlencode({k: v for k, v in params.items()})
             ok, text = sunell_set(ip, username, password, args.http_timeout, params)
             if ok and sunell_response_ok(text):
-                return True, f"Sunell {params['type']}: {text}"
+                ntp_ok = True
+                ntp_message = f"Sunell NTP {params['type']}: {text}"
+                break
             errors.append(f"{params['type']}: {text}")
         except NETWORK_ERRORS as exc:
             errors.append(f"{params['type']}: {exc}")
+
+    timezone_ok = False
+    timezone_message = ""
+    for params in timezone_params:
+        try:
+            if args.dry_run:
+                return True, "dry-run Sunell timezone params: " + urllib.parse.urlencode({k: v for k, v in params.items()})
+            ok, text = sunell_set(ip, username, password, args.http_timeout, params)
+            timezone_value = params.get("timeZone", "")
+            if ok and sunell_response_ok(text):
+                timezone_ok = True
+                timezone_message = f"Sunell timezone {params['type']}={timezone_value}: {text}"
+                break
+            errors.append(f"{params['type']} timezone {timezone_value}: {text}")
+        except NETWORK_ERRORS as exc:
+            errors.append(f"{params['type']} timezone {params.get('timeZone', '')}: {exc}")
+
+    if ntp_ok and timezone_ok:
+        return True, f"{ntp_message}; {timezone_message}"
+    if ntp_ok and not timezone_ok:
+        errors.insert(0, "NTP accepted, but timezone was not accepted")
+    if timezone_ok and not ntp_ok:
+        errors.insert(0, "timezone accepted, but NTP was not accepted")
     return False, "; ".join(errors)
 
 

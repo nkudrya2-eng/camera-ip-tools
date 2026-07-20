@@ -1,0 +1,3 @@
+driver: cross
+auth:
+  method: custom_encrypt

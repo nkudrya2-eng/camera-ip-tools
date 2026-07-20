@@ -1,0 +1,20 @@
+driver: apix_e8
+auth:
+  method: digest
+
+endpoints:
+  network:
+    url: /LAPI/V1.0/Interfaces/0/Network
+    method: PUT
+  timezone:
+    url: /LAPI/V1.0/System/Time
+    method: PUT
+  ntp:
+    url: /LAPI/V1.0/System/Time/NTP
+    method: PUT
+  motion:
+    url: /LAPI/V1.0/Channels/0/Alarm/MotionDetection/Rule
+    method: PUT
+  streams:
+    url: /LAPI/V1.0/Channel/0/Media/Video/Streams/DetailInfos
+    method: PUT

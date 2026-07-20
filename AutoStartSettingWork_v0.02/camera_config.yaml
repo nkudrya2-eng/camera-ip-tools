@@ -1,0 +1,102 @@
+## Список камер. Поле ip поддерживает диапазон: 10.97.242.1-50
+## profile — имя файла из папки profiles/ (без .yaml)
+
+cameras:
+  - ip: "10.97.242.1-50"
+    username: "admin"
+    password: "1234"
+    profile: cross
+
+network:
+  ip_address:  "10.97.242.219"
+  subnet_mask: "255.255.252.0"
+  gateway:     "10.97.240.1"
+  dns_main:    "8.8.8.8"
+  dns_spare:   "192.168.0.2"
+  dhcp:        false
+  mtu:         1500
+
+timezone:
+  # CROSS format
+  timezone:      "(GMT+09:00) Якутия"
+  language:      3
+  # E8 format (целое число, 9 = UTC+8, 45 = UTC+3 Москва — уточни по вебке)
+  timezone_int:  45
+  # S8 format
+  timezone_utc:  "UTC+3"
+  timezone_name: "MSK"
+
+ntp:
+  server:   "10.99.200.60"
+  port:     123
+  enabled:  true
+  interval: 3600   # секунды (для S8 конвертируется в минуты автоматически)
+
+motion:
+  enabled:          true
+  camera_id:        1
+  sensitivity:      5
+  alarm_out_action: 2
+  alarm_interval:   2
+  record:           true
+  smtp:             false
+  ftp:              false
+  stream_flag:      true
+  audio_flag:       false
+  audio_action:     0
+  grid_width:       22
+  grid_height:      18
+  grid_data:        ""
+  motion_mode:      0    # E8: Mode (0=normal), S8: detectionMode
+
+streams:
+  - id: 1                        # Основной поток
+    name: "stream1"
+    enabled: true
+    resolution: "2560x1440"      # WxH — строка для CROSS, парсится для E8/S8
+    codec: "H264"                # H264 / H265
+    audio_codec: "G711_ALAW"     # только CROSS
+    bitrate_type: "CBR"          # CBR / VBR
+    bitrate: 2047                # кбит/с
+    fps: 25
+    gop: 50                      # I-frame interval
+    gop_interval_type: 2         # только CROSS
+    quality: 5                   # 1–8
+    smooth_level: 5              # E8 / S8
+    video_level: 1               # только CROSS (VideoEncodeLevel)
+    smart_encode: false
+    camera_id: 1                 # только CROSS
+
+  - id: 2                        # Субпоток
+    name: "stream2"
+    enabled: true
+    resolution: "720x576"
+    codec: "H264"
+    audio_codec: "G711_ALAW"
+    bitrate_type: "CBR"
+    bitrate: 512
+    fps: 20
+    gop: 40
+    gop_interval_type: 2
+    quality: 5
+    smooth_level: 5
+    video_level: 1
+    smart_encode: false
+    camera_id: 1
+
+  - id: 3                        # Третий поток
+    name: "stream3"
+    enabled: true
+    resolution: "352x288"
+    codec: "H264"
+    audio_codec: "G711_ALAW"
+    bitrate_type: "VBR"
+    bitrate: 128
+    fps: 20
+    gop: 40
+    gop_interval_type: 2
+    quality: 5
+    smooth_level: 5
+    video_level: 1
+    smart_encode: false
+    camera_id: 1

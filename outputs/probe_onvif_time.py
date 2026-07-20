@@ -75,7 +75,7 @@ def parse_credential(value: str) -> tuple[str, str]:
 def wsse_header(username: str, password: str) -> str:
     # ONVIF uses WS-Security UsernameToken digest: Base64(SHA1(nonce + created + password)).
     nonce = os.urandom(16)
-    created = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    created = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     digest = hashlib.sha1(nonce + created.encode("utf-8") + password.encode("utf-8")).digest()
     return f"""
     <s:Header>

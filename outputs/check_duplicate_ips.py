@@ -83,6 +83,11 @@ def response_succeeded(response_text: str) -> bool:
     )
 
 
+def sunell_response_succeeded(response_text: str) -> bool:
+    lower = response_text.lower()
+    return "error" not in lower and "return=-" not in lower
+
+
 def build_unv_payload(new_ip: str, netmask: str, gateway: str) -> dict:
     return {
         "Num": 1,
@@ -149,7 +154,22 @@ def set_ip_sunell(ip: str, username: str, password: str, args: argparse.Namespac
     with urllib.request.urlopen(url, timeout=args.http_timeout) as response:
         text = response.read().decode("utf-8", errors="replace")
         print(f"{ip}: Sunell HTTP {response.status}: {text.strip()}")
-        return response.status == 200
+        if response.status != 200 or not sunell_response_succeeded(text):
+            return False
+
+    restart_params = {
+        "userName": username,
+        "password": password,
+        "action": "restart",
+    }
+    restart_url = f"http://{ip}/cgi-bin/operate.cgi?{urllib.parse.urlencode(restart_params)}"
+    try:
+        with urllib.request.urlopen(restart_url, timeout=args.http_timeout) as response:
+            text = response.read().decode("utf-8", errors="replace")
+            print(f"{ip}: Sunell restart HTTP {response.status}: {text.strip()}")
+    except NETWORK_ERRORS as exc:
+        print(f"{ip}: restart request did not complete after IP change: {exc}")
+    return True
 
 
 def set_ip(ip: str, credentials: list[tuple[str, str]], args: argparse.Namespace, new_ip: str) -> tuple[bool, str, str]:
