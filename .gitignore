@@ -14,6 +14,7 @@ venv/
 *.csv
 *.xlsx
 *.log
+*.zip
 
 # Packet captures
 wire/*.pcap
