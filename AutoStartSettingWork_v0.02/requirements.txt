@@ -1,9 +1,0 @@
-certifi==2026.2.25
-charset-normalizer==3.4.4
-idna==3.11
-prompt_toolkit==3.0.52
-PyYAML==6.0.3
-questionary==2.1.1
-requests==2.32.5
-urllib3==2.6.3
-wcwidth==0.6.0

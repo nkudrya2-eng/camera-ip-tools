@@ -105,6 +105,14 @@ class CameraStore:
             )
         self.connection.commit()
 
+    def remove_cameras(self, name: str, cameras: list[dict]) -> None:
+        identities = [(camera_identity(row), name) for row in cameras]
+        with self.connection:
+            self.connection.executemany(
+                "DELETE FROM cameras WHERE identity = ? AND project_id = (SELECT id FROM projects WHERE name = ?)",
+                identities,
+            )
+
     def delete_project(self, name: str) -> None:
         self.connection.execute("DELETE FROM projects WHERE name = ?", (name,))
         self.connection.commit()

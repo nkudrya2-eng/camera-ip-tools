@@ -3,7 +3,7 @@
 
 cameras:
   - ip: "10.97.242.1-50"
-    username: "admin"
+    username: "Admin"
     password: "1234"
     profile: cross
 
@@ -22,9 +22,9 @@ timezone:
   language:      3
   # E8 format (целое число, 9 = UTC+8, 45 = UTC+3 Москва — уточни по вебке)
   timezone_int:  45
-  # S8 format
-  timezone_utc:  "UTC+3"
-  timezone_name: "MSK"
+  # S8 format (POSIX TZ: GMT+9 -> UTC-9, GMT+3 -> UTC-3)
+  timezone_utc:  "UTC-9"
+  timezone_name: "RUS"
 
 ntp:
   server:   "10.99.200.60"

@@ -2,6 +2,7 @@ import base64
 import re
 import json
 import time
+import sys
 import yaml
 import requests
 from urllib.parse import quote
@@ -9,6 +10,17 @@ from requests.auth import HTTPDigestAuth
 from typing import Optional
 from pathlib import Path
 from types import SimpleNamespace
+
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from probe_onvif_time import compact_fault, onvif_post
 from sync_camera_time import sync_onvif
@@ -81,7 +93,8 @@ class BaseDriver:
 class CrossDriver(BaseDriver):
 
     def connect(self) -> bool:
-        for attempt in range(1, 4):
+        attempts = 2 if self.cam.get("network_autodetect") else 3
+        for attempt in range(1, attempts + 1):
             try:
                 resp = requests.post(
                     f"http://{self.ip}/action/WEB_UsrLoginAjaxProc",
@@ -90,12 +103,12 @@ class CrossDriver(BaseDriver):
                           "LanguageParam": "3"},
                     headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
                              "Referer": f"http://{self.ip}/asppage/common/login.asp?id=3&ret=1"},
-                    timeout=10,
+                    timeout=4 if self.cam.get("network_autodetect") else 10,
                 )
                 resp.raise_for_status()
             except requests.RequestException as exc:
-                print(f"  Попытка {attempt}/3: {exc}")
-                if attempt < 3:
+                print(f"  Попытка {attempt}/{attempts}: {exc}")
+                if attempt < attempts:
                     time.sleep(1)
                 continue
             if resp.text.startswith("szPath="):
@@ -142,6 +155,7 @@ class CrossDriver(BaseDriver):
                      "Referer": f"http://{self.ip}/asppage/common/index.asp?key={self.key}&lg=3&r=0.1"},
             timeout=10,
         )
+        self.network_http_status = resp.status_code
         resp.raise_for_status()
         ok = resp.text.strip().startswith("0")
         print(f"  {'✓' if ok else '✗'} Ответ: {resp.text.strip()[:60]}")
@@ -284,21 +298,25 @@ class ApixE8Driver(BaseDriver):
         self.session.auth = HTTPDigestAuth(self.username, self.password)
         self.onvif_fallback = False
         self.onvif_time_result = None
-        for attempt in range(1, 3):
+        attempts = 2 if self.cam.get("network_autodetect") else 3
+        for attempt in range(1, attempts + 1):
             try:
                 resp = self.session.get(
                     f"http://{self.ip}/LAPI/V1.0/System/DeviceInfo",
-                    timeout=10,
+                    timeout=4 if self.cam.get("network_autodetect") else 10,
                 )
                 if resp.status_code == 200:
                     print("  ✓ LAPI HTTP 200")
                     return True
-                print(f"  LAPI HTTP {resp.status_code}; пробую ONVIF")
+                print(f"  LAPI HTTP {resp.status_code}")
                 break
             except requests.RequestException as exc:
-                print(f"  LAPI попытка {attempt}/2: {exc}")
-                if attempt < 2:
+                print(f"  LAPI попытка {attempt}/{attempts}: {exc}")
+                if attempt < attempts:
                     time.sleep(1)
+        if self.cam.get("network_autodetect"):
+            # ONVIF time access does not establish support for LAPI network writes.
+            return False
         try:
             root = onvif_post(
                 self.ip,
@@ -348,6 +366,12 @@ class ApixE8Driver(BaseDriver):
             timeout=10,
         )
         ok = resp.status_code in (200, 204)
+        self.network_http_status = resp.status_code
+        if section == "network":
+            print(f"  Ответ настройки сети: {resp.text[:800]}")
+            if resp.text.lstrip().lower().startswith(("<!doctype html", "<html")):
+                print("  Вместо ответа API получена HTML-страница; смена IP не подтверждена")
+                return False
         print(f"  {'✓' if ok else '✗'} HTTP {resp.status_code}"
               + (f": {resp.text[:60]}" if not ok else ""))
         return ok
@@ -357,19 +381,96 @@ class ApixE8Driver(BaseDriver):
             print("  ✗ Смена сети через ONVIF для этого профиля не реализована")
             return False
         n = self.cfg["network"]
-        return self._request("network", {
-            "ID": 1, "Name": "eth0",
-            "MTU": n["mtu"],
+
+        # Вариант 1: Подтверждённый LAPI формат (/LAPI/V1.0/Network/Interfaces)
+        payload_interfaces = {
+            "Num": 1,
+            "NetworkInterfaceList": [
+                {
+                    "ID": 1,
+                    "Name": "eth0",
+                    "WorkMode": 0,
+                    "IsInnerNIC": 1,
+                    "InnerNICIPAddress": n["ip_address"],
+                    "InnerNICNetmask": n["subnet_mask"],
+                    "InnerNICName": "eth0",
+                    "MTU": n.get("mtu", 1500),
+                    "MAC": "",
+                    "NegotiationMode": 0,
+                    "IPv4": {
+                        "IPGetType": 1 if n.get("dhcp") else 0,
+                        "PPPoE": {"LoginName": "", "PIN": ""},
+                        "AddressNum": 1,
+                        "AddressList": [
+                            {
+                                "Address": n["ip_address"],
+                                "Netmask": n["subnet_mask"],
+                                "Gateway": n["gateway"],
+                            }
+                        ],
+                    },
+                    "IPv6": {
+                        "IPGetType": 1,
+                        "AddressNum": 1,
+                        "AddressList": [{"PrefixLenth": 64, "Address": "", "Gateway": ""}],
+                    },
+                }
+            ],
+            "DefaultRouteNIC": 1,
+            "WorkMode": 0,
+        }
+
+        try:
+            resp = self.session.put(
+                f"http://{self.ip}/LAPI/V1.0/Network/Interfaces",
+                json=payload_interfaces,
+                headers={"Content-Type": "application/json; charset=UTF-8", "X-Requested-With": "XMLHttpRequest"},
+                timeout=10,
+            )
+            self.network_http_status = resp.status_code
+            print(f"  LAPI Network/Interfaces: HTTP {resp.status_code}")
+            if resp.status_code in (200, 204):
+                if not resp.text.lstrip().lower().startswith(("<!doctype html", "<html")):
+                    print(f"  ✓ Сеть успешно обновлена через /LAPI/V1.0/Network/Interfaces: {resp.text[:200]}")
+                    return True
+        except requests.RequestException as exc:
+            print(f"  Ошибка /LAPI/V1.0/Network/Interfaces: {exc}")
+
+        # Вариант 2: Альтернативный формат Uniview LAPI (/LAPI/V1.0/Interfaces/0/Network)
+        payload_single = {
+            "ID": 1,
+            "Name": "eth0",
+            "MTU": n.get("mtu", 1500),
             "IPv4": {
-                "IPGetType": 1 if n["dhcp"] else 0,
+                "IPGetType": 1 if n.get("dhcp") else 0,
                 "AddressNum": 1,
-                "AddressList": [{
-                    "Address": n["ip_address"],
-                    "Netmask": n["subnet_mask"],
-                    "Gateway": n["gateway"],
-                }],
+                "AddressList": [
+                    {
+                        "Address": n["ip_address"],
+                        "Netmask": n["subnet_mask"],
+                        "Gateway": n["gateway"],
+                    }
+                ],
             },
-        })
+        }
+
+        try:
+            resp = self.session.put(
+                f"http://{self.ip}/LAPI/V1.0/Interfaces/0/Network",
+                json=payload_single,
+                headers={"Content-Type": "application/json; charset=UTF-8", "X-Requested-With": "XMLHttpRequest"},
+                timeout=10,
+            )
+            self.network_http_status = resp.status_code
+            print(f"  LAPI Interfaces/0/Network: HTTP {resp.status_code}")
+            if resp.status_code in (200, 204):
+                if not resp.text.lstrip().lower().startswith(("<!doctype html", "<html")):
+                    print(f"  ✓ Сеть успешно обновлена через /LAPI/V1.0/Interfaces/0/Network: {resp.text[:200]}")
+                    return True
+        except requests.RequestException as exc:
+            print(f"  Ошибка /LAPI/V1.0/Interfaces/0/Network: {exc}")
+
+        return False
 
     def apply_timezone(self) -> bool:
         if self.onvif_fallback:
@@ -461,20 +562,42 @@ class ApixS8Driver(BaseDriver):
     def connect(self) -> bool:
         self.session = requests.Session()
         self.session.auth = HTTPDigestAuth(self.username, self.password)
+        self.session.headers.update({"x-from": "Web", "User-Agent": "Mozilla/5.0"})
         self.onvif_fallback = False
         self.onvif_time_result = None
+        attempts = 2 if self.cam.get("network_autodetect") else 3
+        for attempt in range(1, attempts + 1):
+            try:
+                # Авторизация через /vb.htm (инициализирует Digest Auth в веб-сервере S8)
+                resp = self.session.get(
+                    f"http://{self.ip}/vb.htm?language=ie&curmaxconn",
+                    timeout=4 if self.cam.get("network_autodetect") else 10,
+                )
+                if resp.status_code == 200:
+                    print("  ✓ S8 Auth HTTP 200 (vb.htm)")
+                    return True
+                if resp.status_code == 401:
+                    print("  ✗ S8 Auth 401 (неверный логин/пароль)")
+                    return False
+            except requests.RequestException as e:
+                print(f"  S8 попытка {attempt}/{attempts}: {e}")
+                if attempt < attempts:
+                    time.sleep(1)
+
+        # Резервная проверка через get.network.tcp
         try:
             resp = self.session.get(
-                f"http://{self.ip}/cgi-bin/operator/operator.cgi?action=get.device.info&format=json",
-                timeout=10,
+                f"http://{self.ip}/cgi-bin/admin/admin.cgi?action=get.network.tcp&format=json",
+                timeout=4 if self.cam.get("network_autodetect") else 10,
             )
-            ok = resp.status_code == 200
-            print(f"  {'✓' if ok else '✗'} HTTP {resp.status_code}")
-            if ok:
+            if resp.status_code == 200 and "ipv4" in resp.text.lower():
+                print("  ✓ S8 admin.cgi HTTP 200")
                 return True
-        except Exception as e:
-            print(f"  CGI недоступен: {e}")
+        except Exception:
+            pass
 
+        if self.cam.get("network_autodetect"):
+            return False
         try:
             root = onvif_post(
                 self.ip,
@@ -525,6 +648,20 @@ class ApixS8Driver(BaseDriver):
             timeout=10,
         )
         ok = resp.status_code in (200, 204)
+        self.network_http_status = resp.status_code
+        text_lower = resp.text.lower()
+        if "error" in text_lower or "return=-" in text_lower or "fail" in text_lower:
+            ok = False
+        if "succeed" in text_lower or "success" in text_lower:
+            ok = True
+        if section == "network":
+            print(f"  Ответ настройки сети: {resp.text[:800]}")
+            if resp.text.lstrip().lower().startswith(("<!doctype html", "<html")):
+                print("  Вместо ответа API получена HTML-страница; смена IP не подтверждена")
+                return False
+            if not ok:
+                print("  API вернул код ошибки; смена IP не подтверждена")
+                return False
         print(f"  {'✓' if ok else '✗'} HTTP {resp.status_code}"
               + (f": {resp.text[:60]}" if not ok else ""))
         return ok
@@ -532,27 +669,44 @@ class ApixS8Driver(BaseDriver):
     def apply_network(self) -> bool:
         n = self.cfg["network"]
         return self._request("network", {
-            "mtuByte":        n["mtu"],
+            "mtuByte":        int(n.get("mtu", 1500)),
             "ipv4Ipaddress":  n["ip_address"],
-            "ipv4DhcpEnable": 1 if n["dhcp"] else 0,
+            "ipv4DhcpEnable": 1 if n.get("dhcp") else 0,
             "ipv4netmask":    n["subnet_mask"],
             "ipv4gateway":    n["gateway"],
-            "dns0":           n["dns_main"],
-            "ipv6Mode":       1,
+            "dns0":           n.get("dns_main", "8.8.8.8"),
+            "ipv6Mode":       0,
+            "ipv6Ipaddress":  "",
+            "ipv6netmask":    0,
+            "ipv6gateway":    "",
         })
 
     def _apply_time(self) -> bool:
         """S8 объединяет таймзону и NTP в одном запросе"""
         t = self.cfg["timezone"]
         n = self.cfg["ntp"]
+        tz_utc = t.get("timezone_utc", "")
+        if not tz_utc:
+            match = re.search(r"GMT([+-])(\d{2}):(\d{2})", t.get("timezone", ""))
+            if match:
+                sign, hours, minutes = match.groups()
+                posix_sign = "-" if sign == "+" else "+"
+                tz_min = f":{minutes}" if minutes != "00" else ""
+                tz_utc = f"UTC{posix_sign}{int(hours)}{tz_min}"
+            else:
+                tz_utc = "UTC-9"
+        elif tz_utc.startswith("UTC+"):
+            # POSIX-инверсия: для восточного полушария (Россия) пишется минус (UTC-9 для GMT+9)
+            tz_utc = "UTC-" + tz_utc[4:]
+        zone_name = t.get("timezone_name") or "RUS"
         return self._request("time", {
-            "timeZoneTz":   t["timezone_utc"],
-            "zoneNameTz":   t["timezone_name"],
-            "dayLight":     0,
-            "ntpSyncEnable": 1 if n["enabled"] else 0,
-            "ntpInterval":  n["interval"] // 60,  # секунды → минуты
-            "timeType":     0,
-            "ntpServer":    n["server"],
+            "timeZoneTz":    tz_utc,
+            "zoneNameTz":    zone_name,
+            "dayLight":      0,
+            "timeType":      0,
+            "ntpServer":     n.get("server", "pool.ntp.org"),
+            "ntpSyncEnable": 1 if n.get("enabled", True) else 0,
+            "ntpInterval":   max(1, n.get("interval", 3600) // 60),
         })
 
     def apply_timezone(self) -> bool:

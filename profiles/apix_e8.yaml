@@ -4,7 +4,7 @@ auth:
 
 endpoints:
   network:
-    url: /LAPI/V1.0/Interfaces/0/Network
+    url: /LAPI/V1.0/Network/Interfaces
     method: PUT
   timezone:
     url: /LAPI/V1.0/System/Time

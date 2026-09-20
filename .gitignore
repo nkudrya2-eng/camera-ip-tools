@@ -1,39 +1,29 @@
-.agents/
-.codex/
-work/
-.codex-remote-attachments/
-tmp/
-
-AutoStartSettingWork_v0.02/.venv/
-AutoStartSettingWork_v0.02/__pycache__/
-
+# Python & Runtime
+runtime/
+python_packages/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.venv/
+venv/
 
-outputs/__pycache__/
-outputs/esc_disasm/
-outputs/*.csv
+# Local databases, logs & exports
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.xlsx
+*.log
+
+# Packet captures
+wire/*.pcap
+wire/*.pcapng
 *.pcap
 *.pcapng
-outputs/camera_gallery*.html
-outputs/camera_pnr_report*.md
-outputs/camera_pnr_report*.docx
-outputs/camera_pnr_report*.pdf
-outputs/camera_checklists_from_template.docx
-outputs/camera_gallery_assets/
-outputs/check_docx_render/
-outputs/tmp/
-outputs/.server_install_test/
-outputs/.server_package_test/
-outputs/.zip_content_check/
-outputs/.vscode/
-outputs/1/
-outputs/back/
-outputs/gallery_*/
-outputs/camera_compare_*/
-outputs/camera_241_web/
-outputs/CameraIpTools_WindowsServer_Offline/
-outputs/CameraIpTools_WindowsServer_Offline.zip
-outputs/camera_credentials_notes.txt
-outputs/PF Din Text Cond Pro.ttf
-outputs/camera-pdf-fonts.css
+
+# IDE & system
+.vscode/
+.idea/
+.agents/
+.gemini/
+prompt.txt

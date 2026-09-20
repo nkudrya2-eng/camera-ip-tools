@@ -4,10 +4,10 @@ auth:
 
 endpoints:
   network:
-    url: /cgi-bin/operator/operator.cgi?action=set.network.eth0&format=json
+    url: /cgi-bin/admin/admin.cgi?action=set.network.tcp&format=json
     method: POST
   time:
-    url: /cgi-bin/operator/operator.cgi?action=set.time&format=json
+    url: /cgi-bin/admin/admin.cgi?action=set.system.datetime&format=json
     method: POST
   motion:
     url: /cgi-bin/operator/operator.cgi?action=update.event.motion.detection&format=json
