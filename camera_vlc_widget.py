@@ -130,7 +130,7 @@ class EmbeddedVlcPlayer(ttk.Frame):
         self.header = ttk.Frame(self)
         self.header.pack(fill="x", padx=4, pady=2)
 
-        self.title_label = ttk.Label(self.header, text="📹 Видео выбранной камеры", font=("Segoe UI", 9, "bold"))
+        self.title_label = ttk.Label(self.header, text="📹 Видео выбранной камеры", font=("Segoe UI", 11, "bold"))
         self.title_label.pack(side="left", padx=2)
 
         self.stream_type_var = tk.StringVar(value="sub")

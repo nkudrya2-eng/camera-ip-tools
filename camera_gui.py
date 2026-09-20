@@ -22,6 +22,24 @@ from tkinter.scrolledtext import ScrolledText
 
 import yaml
 
+try:
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+except Exception:
+    pass
+
+try:
+    import ttkbootstrap as tb
+    HAS_TTKBOOTSTRAP = True
+except Exception:
+    HAS_TTKBOOTSTRAP = False
+
 APP_DIR = pathlib.Path(__file__).resolve().parent
 LOCAL_CONFIGURATOR_DIR = APP_DIR.parent / "AutoStartSettingWork_v0.02"
 CONFIGURATOR_DIR = LOCAL_CONFIGURATOR_DIR if LOCAL_CONFIGURATOR_DIR.exists() else APP_DIR
@@ -117,25 +135,51 @@ class CameraGui(tk.Tk):
         self._load_projects()
 
     def _configure_style(self) -> None:
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
+        if HAS_TTKBOOTSTRAP:
+            try:
+                self.style = tb.Style(theme="litera")
+            except Exception:
+                self.style = ttk.Style(self)
+                try:
+                    self.style.theme_use("clam")
+                except Exception:
+                    pass
+        else:
+            self.style = ttk.Style(self)
+            try:
+                self.style.theme_use("clam")
+            except Exception:
+                pass
 
+        # 1. Base fonts (Segoe UI 10pt for controls/menu/text, 11pt bold for headings, Consolas 10pt for fixed/log)
         for font_name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
-            tkfont.nametofont(font_name).configure(family="Segoe UI", size=9)
-        tkfont.nametofont("TkHeadingFont").configure(family="Segoe UI", size=9, weight="bold")
-        tkfont.nametofont("TkFixedFont").configure(family="Consolas", size=9)
+            tkfont.nametofont(font_name).configure(family="Segoe UI", size=10)
+        tkfont.nametofont("TkHeadingFont").configure(family="Segoe UI", size=11, weight="bold")
+        tkfont.nametofont("TkCaptionFont").configure(family="Segoe UI", size=10, weight="bold")
+        tkfont.nametofont("TkSmallCaptionFont").configure(family="Segoe UI", size=9)
+        tkfont.nametofont("TkFixedFont").configure(family="Consolas", size=10)
 
-        style.configure("Treeview", font=("Segoe UI", 9), rowheight=25)
-        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
-        style.configure("TButton", padding=(7, 4), font=("Segoe UI", 9))
-        style.configure("Primary.TButton", padding=(9, 4), font=("Segoe UI", 9, "bold"))
-        style.configure("TEntry", padding=3)
-        style.configure("TCombobox", padding=3)
-        style.configure("FilterChip.TButton", padding=(6, 2), font=("Segoe UI", 8))
-        style.configure("ActiveChip.TButton", padding=(6, 2), font=("Segoe UI", 8, "bold"))
+        # 2. Table (Treeview): 10pt Segoe UI, comfortable 28px row height to prevent clipping on 125-150% scaling
+        self.style.configure("Treeview", font=("Segoe UI", 10), rowheight=28)
+        self.style.configure("Treeview.Heading", font=("Segoe UI", 11, "bold"), padding=(4, 6))
+
+        # 3. Compact buttons: 10pt Segoe UI with tight vertical padding (8, 3) to keep 1-row layout compact on High DPI
+        self.style.configure("TButton", padding=(8, 3), font=("Segoe UI", 10))
+        self.style.configure("Primary.TButton", padding=(8, 3), font=("Segoe UI", 10, "bold"))
+        self.style.configure("TMenubutton", padding=(8, 3), font=("Segoe UI", 10))
+
+        # 4. Inputs & Labels: 10pt Segoe UI, 3px vertical padding
+        self.style.configure("TEntry", font=("Segoe UI", 10), padding=3)
+        self.style.configure("TCombobox", font=("Segoe UI", 10), padding=3)
+        self.style.configure("TLabel", font=("Segoe UI", 10))
+        self.style.configure("TLabelframe.Label", font=("Segoe UI", 11, "bold"))
+        self.style.configure("TNotebook.Tab", font=("Segoe UI", 10), padding=(10, 4))
+        self.style.configure("TCheckbutton", font=("Segoe UI", 10))
+        self.style.configure("TRadiobutton", font=("Segoe UI", 10))
+
+        # 5. Quick filter chips (normal: 10 pt regular, active: 10 pt bold)
+        self.style.configure("FilterChip.TButton", padding=(6, 2), font=("Segoe UI", 10))
+        self.style.configure("ActiveChip.TButton", padding=(6, 2), font=("Segoe UI", 10, "bold"))
 
     # =========================================================================
     # UI CONSTRUCTION (Wireshark 3-Pane Layout)
@@ -178,7 +222,7 @@ class CameraGui(tk.Tk):
 
         # Dropdown: Действия
         self.actions_mb = ttk.Menubutton(bar, text="Действия ▾")
-        self.actions_menu = tk.Menu(self.actions_mb, tearoff=0)
+        self.actions_menu = tk.Menu(self.actions_mb, tearoff=0, font=("Segoe UI", 10))
         self.actions_mb.configure(menu=self.actions_menu)
         self.actions_mb.grid(row=0, column=2, padx=(0, 4))
 
@@ -199,7 +243,7 @@ class CameraGui(tk.Tk):
 
         # Dropdown: Профили
         self.profiles_mb = ttk.Menubutton(bar, text="Профили ▾")
-        self.profiles_menu = tk.Menu(self.profiles_mb, tearoff=0)
+        self.profiles_menu = tk.Menu(self.profiles_mb, tearoff=0, font=("Segoe UI", 10))
         self.profiles_mb.configure(menu=self.profiles_menu)
         self.profiles_mb.grid(row=0, column=3, padx=(0, 8))
 
@@ -276,8 +320,8 @@ class CameraGui(tk.Tk):
             self.chip_buttons[key] = btn
         self._update_chip_styles()
 
-        # Counter Label
-        self.counter_label = ttk.Label(bar, text="Найдено: 0 | Показано: 0 | Отмечено: 0", font=("Segoe UI", 9, "bold"))
+        # Counter Label (11 pt bold)
+        self.counter_label = ttk.Label(bar, text="Найдено: 0 | Показано: 0 | Отмечено: 0", font=("Segoe UI", 11, "bold"))
         self.counter_label.grid(row=0, column=3, sticky="e")
 
     def _build_camera_table(self, parent) -> None:
@@ -349,12 +393,12 @@ class CameraGui(tk.Tk):
 
         log_toolbar = ttk.Frame(log_pane, padding=(4, 2))
         log_toolbar.grid(row=0, column=0, sticky="ew")
-        ttk.Label(log_toolbar, text="📋 Журнал операций", font=("Segoe UI", 9, "bold")).pack(side="left", padx=2)
+        ttk.Label(log_toolbar, text="📋 Журнал операций", font=("Segoe UI", 11, "bold")).pack(side="left", padx=2)
         ttk.Button(log_toolbar, text="🧹 Очистить", width=10, command=self._clear_log).pack(side="left", padx=6)
         ttk.Button(log_toolbar, text="💾 Сохранить...", width=12, command=self._save_log_dialog).pack(side="left", padx=2)
         ttk.Checkbutton(log_toolbar, text="Автопрокрутка", variable=self.autoscroll_log).pack(side="right", padx=4)
 
-        self.log = ScrolledText(log_pane, wrap="word", height=8, font=("Consolas", 9), bg="#181a1f", fg="#dcdfe4", insertbackground="white")
+        self.log = ScrolledText(log_pane, wrap="word", height=8, font=("Consolas", 10), bg="#181a1f", fg="#dcdfe4", insertbackground="white")
         self.log.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
         self.log.tag_configure("success", foreground="#98c379")
         self.log.tag_configure("error", foreground="#e06c75")
@@ -384,7 +428,7 @@ class CameraGui(tk.Tk):
 
         admin_text = "🛡 Администратор" if self._is_admin() else "⚠ Пользователь"
         admin_fg = "green" if self._is_admin() else "orange"
-        lbl = tk.Label(status_frame, text=admin_text, fg=admin_fg, font=("Segoe UI", 8, "bold"))
+        lbl = tk.Label(status_frame, text=admin_text, fg=admin_fg, font=("Segoe UI", 9, "bold"))
         lbl.grid(row=0, column=2, sticky="e")
 
     # =========================================================================
@@ -392,7 +436,7 @@ class CameraGui(tk.Tk):
     # =========================================================================
 
     def _build_context_menu(self) -> None:
-        self.row_menu = tk.Menu(self, tearoff=0)
+        self.row_menu = tk.Menu(self, tearoff=0, font=("Segoe UI", 10))
 
         # Video section
         self.row_menu.add_command(label="📹 Открыть видео (доп. поток)", command=lambda: self._play_selected_video("sub"))
@@ -406,7 +450,7 @@ class CameraGui(tk.Tk):
         self.row_menu.add_command(label="🎬 Видеопотоки и кодек...", command=self._open_camera_video_dialog)
 
         # Submenu: Применить профиль
-        self.profile_submenu = tk.Menu(self.row_menu, tearoff=0)
+        self.profile_submenu = tk.Menu(self.row_menu, tearoff=0, font=("Segoe UI", 10))
         for k, name in profiles_mod.list_profile_items():
             self.profile_submenu.add_command(
                 label=name,
@@ -419,7 +463,7 @@ class CameraGui(tk.Tk):
         self.row_menu.add_separator()
 
         # Clipboard & filter section
-        copy_menu = tk.Menu(self.row_menu, tearoff=0)
+        copy_menu = tk.Menu(self.row_menu, tearoff=0, font=("Segoe UI", 10))
         copy_menu.add_command(label="IP-адрес", command=lambda: self._copy_cell("ip"))
         copy_menu.add_command(label="MAC-адрес", command=lambda: self._copy_cell("mac"))
         copy_menu.add_command(label="Всю строку", command=self._copy_row_text)
@@ -767,22 +811,22 @@ class CameraGui(tk.Tk):
         res_frame = ttk.LabelFrame(frame, text="Расчётный битрейт и архив", padding=12)
         res_frame.pack(fill="both", expand=True, pady=12)
 
-        lbl_main = ttk.Label(res_frame, font=("Segoe UI", 9))
+        lbl_main = ttk.Label(res_frame, font=("Segoe UI", 10))
         lbl_main.pack(anchor="w", pady=2)
 
-        lbl_sub = ttk.Label(res_frame, font=("Segoe UI", 9))
+        lbl_sub = ttk.Label(res_frame, font=("Segoe UI", 10))
         lbl_sub.pack(anchor="w", pady=2)
 
-        lbl_total = ttk.Label(res_frame, font=("Segoe UI", 10, "bold"))
+        lbl_total = ttk.Label(res_frame, font=("Segoe UI", 11, "bold"))
         lbl_total.pack(anchor="w", pady=4)
 
-        lbl_storage = ttk.Label(res_frame, font=("Segoe UI", 9))
+        lbl_storage = ttk.Label(res_frame, font=("Segoe UI", 10))
         lbl_storage.pack(anchor="w", pady=2)
 
         lbl_note = ttk.Label(
             res_frame,
             text="⚠️ Внимание: Это теоретический расчёт исходя из битрейта профилей,\nа не физический замер фактического трафика в коммутаторах сети.",
-            font=("Segoe UI", 8, "italic"),
+            font=("Segoe UI", 9, "italic"),
             foreground="#666666",
         )
         lbl_note.pack(anchor="w", pady=(8, 0))
@@ -955,7 +999,7 @@ class CameraGui(tk.Tk):
         header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
         _settings, cameras = self.store.load_project(self.current_project_name)
-        ttk.Label(header, text=f"Всего сохранено в базе данных: {len(cameras)} камер", font=("Segoe UI", 9, "bold")).pack(side="left")
+        ttk.Label(header, text=f"Всего сохранено в базе данных: {len(cameras)} камер", font=("Segoe UI", 11, "bold")).pack(side="left")
 
         tree = ttk.Treeview(frame, columns=("ip", "model", "mac", "serial", "status", "updated"), show="headings")
         tree.heading("ip", text="IP адрес")
