@@ -3,6 +3,7 @@ import csv
 import concurrent.futures
 import datetime as dt
 import ipaddress
+import json
 import os
 import pathlib
 import queue
@@ -17,6 +18,7 @@ import webbrowser
 from contextlib import redirect_stderr, redirect_stdout
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
+from tkinter.scrolledtext import ScrolledText
 
 import yaml
 
@@ -30,20 +32,14 @@ from camera_inventory_reader import probe_onvif_camera, read_camera_settings
 from camera_store import CameraStore, camera_identity
 from camera_table_tools import FIELDS, matches, clear_readings, export_rows
 from camera_video import find_vlc, stream_uri, launch_video, camera_url
-
+import camera_profiles as profiles_mod
+from camera_vlc_widget import EmbeddedVlcPlayer
 
 DEFAULT_CONFIG = CONFIGURATOR_DIR / "camera_config.yaml"
 DATABASE_PATH = APP_DIR / "camera_tools.db"
-SCAN_PASSES = 3
 DEFAULT_CAMERA_IP = "192.168.0.250"
 DEFAULT_ASSIGNMENT_LOG = APP_DIR / "default_ip_assignment_results.csv"
-OPERATIONS = [
-    ("network", "Сеть", "apply_network"),
-    ("timezone", "Часовой пояс", "apply_timezone"),
-    ("ntp", "NTP", "apply_ntp"),
-    ("motion", "Детектор движения", "apply_motion"),
-    ("streams", "Потоки видео", "apply_streams"),
-]
+
 TIMEZONE_VALUES = [f"(GMT{offset:+03d}:00)" for offset in range(-12, 15)]
 TIMEZONE_VALUES[TIMEZONE_VALUES.index("(GMT+09:00)")] = "(GMT+09:00) Якутия"
 
@@ -62,15 +58,16 @@ class QueueWriter:
 
 
 class CameraGui(tk.Tk):
+    """Modern Wireshark-inspired 3-pane interface for CameraIpTools."""
+
     def __init__(self) -> None:
         super().__init__()
-        self.title("Camera IP Tools — 2026.09.3")
-        self.geometry("1380x850")
-        self.minsize(1100, 760)
+        self.title("Camera IP Tools — 2026.09.4")
+        self.geometry("1420x880")
+        self.minsize(1100, 720)
 
         self.config_data = {}
-        self.cameras = []
-        self.inventory = []
+        self.inventory = []  # Fast clean startup: starts empty!
         self.events = queue.Queue()
         self.running = False
         self.cancel_requested = threading.Event()
@@ -80,1485 +77,1245 @@ class CameraGui(tk.Tk):
         self.sort_reverse = False
         self.table_headings = {}
         self.column_filters = {}
+        self.quick_filter = "all"
         self.scan_time = ""
-        self.video_pending = False
         self.store = CameraStore(DATABASE_PATH)
+        self.custom_profiles = {}
+        self.selected_profile_key = tk.StringVar(value="medium")
+
+        # Global parameters (configured via Settings dialog)
+        self.scan_start = tk.StringVar(value="192.168.0.250")
+        self.scan_end = tk.StringVar(value="192.168.0.250")
+        self.pass_count = tk.StringVar(value="1")
+        self.vendor_discovery = tk.BooleanVar(value=True)
+        self.interface_ip = tk.StringVar(value="")
+        self.network_mask = tk.StringVar(value="255.255.252.0")
+        self.gateway = tk.StringVar(value="10.81.240.1")
+        self.dns_main = tk.StringVar(value="8.8.8.8")
+        self.default_username = tk.StringVar(value="Admin")
+        self.default_password = tk.StringVar(value="1234")
+        self.credential_exceptions = tk.StringVar()
+        self.ntp_server = tk.StringVar(value="10.99.200.60")
+        self.cross_timezone = tk.StringVar(value="(GMT+09:00) Якутия")
+        self.target_start = tk.StringVar(value="10.81.241.150")
+        self.target_end = tk.StringVar(value="10.81.241.200")
+        self.apply_video_profile = tk.BooleanVar(value=True)
+
+        # UI state
+        self.bottom_collapsed = False
+        self.autoscroll_log = tk.BooleanVar(value=True)
+        self.filter_text = tk.StringVar()
 
         configurator.PROFILES_DIR = CONFIGURATOR_DIR / "profiles"
         self._configure_style()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(100, self._drain_events)
+        self.after(50, self._drain_events)
+
         if DEFAULT_CONFIG.exists():
-            self.config_path.set(str(DEFAULT_CONFIG))
-            self.load_config()
+            self._load_config_file(DEFAULT_CONFIG)
         self._load_projects()
 
     def _configure_style(self) -> None:
-        for font_name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
-            tkfont.nametofont(font_name).configure(size=10)
-        tkfont.nametofont("TkHeadingFont").configure(size=10, weight="bold")
-        tkfont.nametofont("TkFixedFont").configure(size=10)
         style = ttk.Style(self)
-        style.configure("Treeview", font=("Segoe UI", 10), rowheight=26)
-        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
-        style.configure("TButton", padding=(8, 5))
-        style.configure("TEntry", padding=4)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        for font_name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            tkfont.nametofont(font_name).configure(family="Segoe UI", size=9)
+        tkfont.nametofont("TkHeadingFont").configure(family="Segoe UI", size=9, weight="bold")
+        tkfont.nametofont("TkFixedFont").configure(family="Consolas", size=9)
+
+        style.configure("Treeview", font=("Segoe UI", 9), rowheight=25)
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        style.configure("TButton", padding=(7, 4), font=("Segoe UI", 9))
+        style.configure("Primary.TButton", padding=(9, 4), font=("Segoe UI", 9, "bold"))
+        style.configure("TEntry", padding=3)
+        style.configure("TCombobox", padding=3)
+        style.configure("FilterChip.TButton", padding=(6, 2), font=("Segoe UI", 8))
+        style.configure("ActiveChip.TButton", padding=(6, 2), font=("Segoe UI", 8, "bold"))
+
+    # =========================================================================
+    # UI CONSTRUCTION (Wireshark 3-Pane Layout)
+    # =========================================================================
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=3)
-        self.rowconfigure(5, weight=2)
+        self.rowconfigure(2, weight=1)  # PanedWindow expands
 
-        source = ttk.Frame(self, padding=(12, 12, 12, 6))
-        source.grid(row=0, column=0, sticky="ew")
-        source.columnconfigure(1, weight=1)
-        ttk.Label(source, text="Объект").grid(row=0, column=0, padx=(0, 8))
+        # 1. Top Toolbar (Compact 1 Row)
+        self._build_top_toolbar()
+
+        # 2. Filter & Quick-filter Bar
+        self._build_filter_bar()
+
+        # 3. Main 3-Pane Layout (Vertical PanedWindow)
+        self.v_paned = ttk.PanedWindow(self, orient="vertical")
+        self.v_paned.grid(row=2, column=0, sticky="nsew", padx=6, pady=(2, 4))
+
+        # 3a. Top Pane: Camera Table
+        self._build_camera_table(self.v_paned)
+
+        # 3b. Bottom Pane: Horizontal PanedWindow (Log + Video)
+        self._build_bottom_panes(self.v_paned)
+
+        # 4. Status Bar
+        self._build_status_bar()
+
+    def _build_top_toolbar(self) -> None:
+        bar = ttk.Frame(self, padding=(8, 6, 8, 2))
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.columnconfigure(10, weight=1)
+
+        # Main Action Buttons
+        self.btn_scan = ttk.Button(bar, text="🔍 Поиск", style="Primary.TButton", command=self.start_scan)
+        self.btn_scan.grid(row=0, column=0, padx=(0, 4))
+
+        self.btn_stop = ttk.Button(bar, text="⏹ Остановить", command=self._request_stop, state="disabled")
+        self.btn_stop.grid(row=0, column=1, padx=(0, 8))
+
+        # Dropdown: Действия
+        self.actions_mb = ttk.Menubutton(bar, text="Действия ▾")
+        self.actions_menu = tk.Menu(self.actions_mb, tearoff=0)
+        self.actions_mb.configure(menu=self.actions_menu)
+        self.actions_mb.grid(row=0, column=2, padx=(0, 4))
+
+        self.actions_menu.add_command(label="Назначить 192.168.0.250...", command=self.apply_default_network_plan)
+        self.actions_menu.add_command(label="Сформировать адресный план...", command=self.build_address_plan)
+        self.actions_menu.add_command(label="Применить настройки к отмеченным...", command=self.apply_selected)
+        self.actions_menu.add_command(label="Прочитать настройки отмеченных...", command=self.read_selected_details)
+        self.actions_menu.add_command(label="Проверить доступность (Ping)...", command=self.check_selected_ping)
+        self.actions_menu.add_separator()
+        self.actions_menu.add_command(label="Отметить все", command=lambda: self._set_all_assign(True))
+        self.actions_menu.add_command(label="Снять все отметки", command=lambda: self._set_all_assign(False))
+        self.actions_menu.add_command(label="Очистить текущий список", command=self.clear_inventory)
+        self.actions_menu.add_separator()
+        self.actions_menu.add_command(label="Экспорт в Excel (.xlsx)...", command=lambda: self._export_dialog("xlsx"))
+        self.actions_menu.add_command(label="Экспорт в CSV...", command=lambda: self._export_dialog("csv"))
+        self.actions_menu.add_separator()
+        self.actions_menu.add_command(label="История объекта и сохранённые камеры...", command=self._open_history_dialog)
+
+        # Dropdown: Профили
+        self.profiles_mb = ttk.Menubutton(bar, text="Профили ▾")
+        self.profiles_menu = tk.Menu(self.profiles_mb, tearoff=0)
+        self.profiles_mb.configure(menu=self.profiles_menu)
+        self.profiles_mb.grid(row=0, column=3, padx=(0, 8))
+
+        for k, name in profiles_mod.list_profile_items():
+            self.profiles_menu.add_radiobutton(
+                label=f"{name}",
+                variable=self.selected_profile_key,
+                value=k,
+                command=self._on_profile_selected,
+            )
+        self.profiles_menu.add_separator()
+        self.profiles_menu.add_command(label="Оценка суммарного трафика...", command=self._open_traffic_dialog)
+        self.profiles_menu.add_command(label="Импорт профилей...", command=self._import_profiles_dialog)
+        self.profiles_menu.add_command(label="Экспорт профилей...", command=self._export_profiles_dialog)
+
+        # Settings Dialog Button
+        ttk.Button(bar, text="⚙ Параметры...", command=self._open_settings_dialog).grid(row=0, column=4, padx=(0, 12))
+
+        # Toggle Bottom Panes Button
+        self.btn_toggle_bottom = ttk.Button(bar, text="▼ Скрыть панель", width=16, command=self._toggle_bottom_pane)
+        self.btn_toggle_bottom.grid(row=0, column=5, padx=(0, 12))
+
+        # Project Selection (Right Aligned)
+        proj_frame = ttk.Frame(bar)
+        proj_frame.grid(row=0, column=10, sticky="e")
+        ttk.Label(proj_frame, text="Объект:").pack(side="left", padx=(0, 4))
         self.project_name = tk.StringVar()
-        self.project_box = ttk.Combobox(source, textvariable=self.project_name, state="readonly")
-        self.project_box.grid(row=0, column=1, sticky="ew")
+        self.project_box = ttk.Combobox(proj_frame, textvariable=self.project_name, state="readonly", width=18)
+        self.project_box.pack(side="left", padx=2)
         self.project_box.bind("<<ComboboxSelected>>", self._project_changed)
-        ttk.Button(source, text="Новый", command=self._new_project).grid(row=0, column=2, padx=6)
-        ttk.Button(source, text="Удалить", command=self._delete_project).grid(row=0, column=3)
+        ttk.Button(proj_frame, text="+", width=3, command=self._new_project).pack(side="left", padx=1)
+        ttk.Button(proj_frame, text="-", width=3, command=self._delete_project).pack(side="left", padx=1)
 
-        ttk.Label(source, text="Конфигурация").grid(row=1, column=0, padx=(0, 8), pady=(8, 0))
-        self.config_path = tk.StringVar()
-        ttk.Entry(source, textvariable=self.config_path).grid(row=1, column=1, sticky="ew", pady=(8, 0))
-        ttk.Button(source, text="Обзор", command=self.choose_config).grid(row=1, column=2, padx=6, pady=(8, 0))
-        ttk.Button(source, text="Загрузить", command=self.load_config).grid(row=1, column=3, pady=(8, 0))
+    def _build_filter_bar(self) -> None:
+        bar = ttk.Frame(self, padding=(8, 2, 8, 4))
+        bar.grid(row=1, column=0, sticky="ew")
+        bar.columnconfigure(1, weight=1)
 
-        scan = ttk.Frame(self, padding=(12, 6))
-        scan.grid(row=1, column=0, sticky="ew")
-        for column in (2, 5, 8):
-            scan.columnconfigure(column, weight=1)
-        self.vendor_discovery = tk.BooleanVar(value=False)
-        ttk.Checkbutton(scan, text="Поиск производителя", variable=self.vendor_discovery).grid(
-            row=0, column=0, padx=(0, 12), sticky="w"
-        )
-        ttk.Label(scan, text="Сканировать от").grid(row=0, column=1, padx=(0, 4))
-        self.scan_start = tk.StringVar(value="192.168.0.250")
-        ttk.Entry(scan, textvariable=self.scan_start, width=16).grid(row=0, column=2, sticky="ew")
-        ttk.Label(scan, text="до").grid(row=0, column=3, padx=4)
-        self.scan_end = tk.StringVar()
-        ttk.Entry(scan, textvariable=self.scan_end, width=16).grid(row=0, column=4, sticky="ew")
-        ttk.Label(scan, text="IP интерфейса").grid(row=0, column=5, padx=(12, 4), sticky="e")
-        self.interface_ip = tk.StringVar()
-        ttk.Entry(scan, textvariable=self.interface_ip, width=16).grid(row=0, column=6, sticky="ew")
-        self.scan_button = ttk.Button(scan, text="Сканировать", command=self.start_scan)
-        self.scan_button.grid(row=0, column=7, padx=(12, 0))
+        ttk.Label(bar, text="Фильтр:").grid(row=0, column=0, padx=(0, 4))
 
-        ttk.Label(scan, text="Назначать от").grid(row=1, column=1, padx=(0, 4), pady=(8, 0))
-        self.target_start = tk.StringVar()
-        ttk.Entry(scan, textvariable=self.target_start, width=16).grid(row=1, column=2, sticky="ew", pady=(8, 0))
-        ttk.Label(scan, text="до").grid(row=1, column=3, padx=4, pady=(8, 0))
-        self.target_end = tk.StringVar()
-        ttk.Entry(scan, textvariable=self.target_end, width=16).grid(row=1, column=4, sticky="ew", pady=(8, 0))
-        ttk.Label(scan, text="Прогонов").grid(row=1, column=5, padx=(12, 4), pady=(8, 0), sticky="e")
-        self.pass_count = tk.StringVar(value="1")
-        ttk.Combobox(
-            scan,
-            textvariable=self.pass_count,
-            values=("1", "2", "3", "без ограничения"),
-            state="readonly",
-            width=18,
-        ).grid(row=1, column=6, sticky="ew", pady=(8, 0))
-        ttk.Button(scan, text="Сформировать план", command=self.build_address_plan).grid(
-            row=1, column=7, padx=(12, 0), pady=(8, 0)
-        )
+        entry_frame = ttk.Frame(bar)
+        entry_frame.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        entry_frame.columnconfigure(0, weight=1)
 
-        ttk.Label(scan, text="Маска").grid(row=2, column=1, padx=(0, 4), pady=(8, 0))
-        self.network_mask = tk.StringVar()
-        ttk.Entry(scan, textvariable=self.network_mask, width=16).grid(row=2, column=2, sticky="ew", pady=(8, 0))
-        ttk.Label(scan, text="Шлюз").grid(row=2, column=3, padx=4, pady=(8, 0))
-        self.gateway = tk.StringVar()
-        ttk.Entry(scan, textvariable=self.gateway, width=16).grid(row=2, column=4, sticky="ew", pady=(8, 0))
-        ttk.Label(scan, text="DNS").grid(row=2, column=5, padx=(12, 4), pady=(8, 0), sticky="e")
-        self.dns_main = tk.StringVar()
-        ttk.Entry(scan, textvariable=self.dns_main, width=16).grid(row=2, column=6, sticky="ew", pady=(8, 0))
+        self.filter_entry = ttk.Entry(entry_frame, textvariable=self.filter_text)
+        self.filter_entry.grid(row=0, column=0, sticky="ew")
+        self.filter_entry.bind("<KeyRelease>", lambda _e: self._on_filter_changed())
 
-        settings = ttk.Frame(self, padding=(12, 6))
-        settings.grid(row=2, column=0, sticky="ew")
-        settings.columnconfigure(7, weight=1)
-        self.operation_vars = {}
-        for column, (key, label, _method) in enumerate(OPERATIONS):
-            var = tk.BooleanVar(value=False)
-            self.operation_vars[key] = var
-            ttk.Checkbutton(settings, text=label, variable=var).grid(row=0, column=column, padx=(0, 12))
-        ttk.Label(settings, text="NTP").grid(row=0, column=5, padx=(12, 4))
-        self.ntp_server = tk.StringVar()
-        ttk.Entry(settings, textvariable=self.ntp_server, width=18).grid(row=0, column=6)
-        ttk.Label(settings, text="Пояс CROSS").grid(row=0, column=7, padx=(12, 4), sticky="e")
-        self.cross_timezone = tk.StringVar()
-        self.timezone_box = ttk.Combobox(
-            settings,
-            textvariable=self.cross_timezone,
-            values=TIMEZONE_VALUES,
-            state="readonly",
-            width=25,
-        )
-        self.timezone_box.grid(row=0, column=8)
-        ttk.Label(settings, text="Логин").grid(row=1, column=0, padx=(0, 4), pady=(8, 0), sticky="w")
-        self.default_username = tk.StringVar(value="Admin")
-        ttk.Entry(settings, textvariable=self.default_username, width=16).grid(
-            row=1, column=1, padx=(0, 12), pady=(8, 0), sticky="w"
-        )
-        ttk.Label(settings, text="Пароль").grid(row=1, column=2, padx=(0, 4), pady=(8, 0), sticky="w")
-        self.default_password = tk.StringVar(value="1234")
-        ttk.Entry(settings, textvariable=self.default_password, width=18, show="•").grid(
-            row=1, column=3, padx=(0, 12), pady=(8, 0), sticky="w"
-        )
-        ttk.Label(settings, text="Исключения доступа").grid(
-            row=1, column=4, padx=(12, 4), pady=(8, 0), sticky="e"
-        )
-        self.credential_exceptions = tk.StringVar()
-        ttk.Entry(settings, textvariable=self.credential_exceptions).grid(
-            row=1, column=5, columnspan=4, pady=(8, 0), sticky="ew"
-        )
+        self.btn_clear_filter = ttk.Button(entry_frame, text="✖", width=3, command=self._clear_filter)
+        self.btn_clear_filter.grid(row=0, column=1, padx=(2, 0))
 
-        table_frame = ttk.Frame(self, padding=(12, 6))
-        table_frame.grid(row=3, column=0, sticky="nsew")
-        table_frame.rowconfigure(1, weight=1)
-        table_frame.columnconfigure(0, weight=1)
+        # Quick Filter Chips
+        chips_frame = ttk.Frame(bar)
+        chips_frame.grid(row=0, column=2, sticky="e", padx=(0, 12))
+
+        self.chip_buttons = {}
+        chips = [
+            ("all", "Все"),
+            ("default_ip", "192.168.0.250"),
+            ("errors", "Ошибки"),
+            ("offline", "Недоступные"),
+            ("h264", "H.264"),
+            ("h265", "H.265"),
+            ("unread", "Не прочитаны"),
+        ]
+        for key, label in chips:
+            btn = ttk.Button(
+                chips_frame,
+                text=label,
+                style="FilterChip.TButton",
+                command=lambda k=key: self._set_quick_filter(k),
+            )
+            btn.pack(side="left", padx=1)
+            self.chip_buttons[key] = btn
+        self._update_chip_styles()
+
+        # Counter Label
+        self.counter_label = ttk.Label(bar, text="Найдено: 0 | Показано: 0 | Отмечено: 0", font=("Segoe UI", 9, "bold"))
+        self.counter_label.grid(row=0, column=3, sticky="e")
+
+    def _build_camera_table(self, parent) -> None:
+        frame = ttk.Frame(parent)
+        parent.add(frame, weight=3)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
         columns = (
-            "assign", "ip", "new_ip", "model", "mac", "serial", "mask", "gateway_read",
+            "actions", "assign", "ip", "new_ip", "model", "mac", "serial", "mask", "gateway_read",
             "ntp_read", "timezone_read", "codec", "profile", "seen", "status",
         )
-        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
-        for key, label, width in [
-            ("assign", "Назначить", 75),
-            ("ip", "Текущий IP", 120),
-            ("new_ip", "Новый IP", 120),
-            ("model", "Модель", 260),
-            ("mac", "MAC", 140),
-            ("serial", "S/N / DeviceID", 150),
-            ("mask", "Маска", 120),
-            ("gateway_read", "Шлюз камеры", 120),
-            ("ntp_read", "NTP камеры", 130),
-            ("timezone_read", "Часовой пояс", 150),
-            ("codec", "Кодек", 80),
-            ("profile", "Профиль", 100),
-            ("seen", "Ответы", 70),
-            ("status", "Статус", 180),
-        ]:
+        self.table = ttk.Treeview(frame, columns=columns, show="headings", selectmode="extended")
+
+        col_defs = [
+            ("actions", "⋮", 36, "center"),
+            ("assign", "Назначить", 80, "center"),
+            ("ip", "Текущий IP", 120, "w"),
+            ("new_ip", "Новый IP", 120, "w"),
+            ("model", "Модель", 240, "w"),
+            ("mac", "MAC-адрес", 140, "w"),
+            ("serial", "S/N / DeviceID", 140, "w"),
+            ("mask", "Маска", 115, "w"),
+            ("gateway_read", "Шлюз", 115, "w"),
+            ("ntp_read", "NTP камеры", 125, "w"),
+            ("timezone_read", "Часовой пояс", 140, "w"),
+            ("codec", "Кодек", 75, "w"),
+            ("profile", "Профиль", 95, "w"),
+            ("seen", "Ответы", 65, "center"),
+            ("status", "Статус", 200, "w"),
+        ]
+
+        for key, label, width, anchor in col_defs:
             self.table_headings[key] = label
-            self.table.heading(key, text=label, command=lambda column=key: self._sort_table(column))
-            self.table.column(key, width=width, anchor="w")
-        filters = ttk.Frame(table_frame)
-        filters.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        filters.columnconfigure(1, weight=1)
-        ttk.Label(filters, text="Найти в таблице").grid(row=0, column=0, padx=(0, 8))
-        self.filter_text = tk.StringVar()
-        ttk.Entry(filters, textvariable=self.filter_text).grid(row=0, column=1, sticky="ew")
-        self.filter_field = tk.StringVar(value="Все поля")
-        self.filter_fields = {"Все поля": "", **{label: key for key, label in self.table_headings.items() if key != "assign"}}
-        ttk.Combobox(filters, textvariable=self.filter_field, values=list(self.filter_fields),
-                     state="readonly", width=20).grid(row=0, column=2, padx=6)
-        ttk.Button(filters, text="Сбросить фильтры", command=self._reset_filters).grid(row=0, column=3)
-        ttk.Button(filters, text="История", command=self._show_history).grid(row=0, column=4, padx=6)
-        self.export_scope = tk.StringVar(value="Показанные строки")
-        ttk.Combobox(filters, textvariable=self.export_scope,
-                     values=("Показанные строки", "Весь текущий список", "Отмеченные строки"),
-                     state="readonly", width=23).grid(row=0, column=5)
-        self.table_summary = tk.StringVar()
-        ttk.Label(filters, textvariable=self.table_summary).grid(row=1, column=0, columnspan=6, sticky="w", pady=(5, 0))
-        self.filter_text.trace_add("write", self._filter_changed)
-        self.filter_field.trace_add("write", self._filter_changed)
-        self.table.grid(row=1, column=0, sticky="nsew")
-        self.table.bind("<Button-3>", self._context_menu)
-        self.context_menu = tk.Menu(self, tearoff=False)
-        self.context_menu.add_command(label="Открыть видео (VLC)", command=self._open_video)
-        self.context_menu.add_command(label="Открыть в браузере", command=self._open_selected_web)
-        self.context_menu.add_separator()
-        self.context_menu.add_command(label="Убрать из списка", command=self._remove_selected)
-        self.table.bind("<Button-1>", self._table_click, add=True)
-        self.table.bind("<Double-1>", self._open_camera_web, add=True)
-        self.table.bind("<Control-c>", self.copy_table_rows)
-        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
-        scrollbar.grid(row=1, column=1, sticky="ns")
-        horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
-        horizontal.grid(row=2, column=0, sticky="ew")
-        self.table.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
+            self.table.heading(key, text=label, command=lambda c=key: self._sort_table(c))
+            self.table.column(key, width=width, anchor=anchor)
 
-        actions = ttk.Frame(self, padding=(12, 6))
-        actions.grid(row=4, column=0, sticky="ew")
-        self.select_all_button = ttk.Button(actions, text="Отметить все", command=self.select_all)
-        self.select_all_button.pack(side="left")
-        self.test_button = ttk.Button(actions, text="Проверить подключение", command=self.test_selected)
-        self.test_button.pack(side="left", padx=8)
-        self.details_button = ttk.Button(actions, text="Обновить данные", command=self.refresh_details)
-        self.details_button.pack(side="left", padx=(0, 8))
-        self.apply_button = ttk.Button(actions, text="Применить выбранное", command=self.apply_selected)
-        self.apply_button.pack(side="left")
-        self.address_button = ttk.Button(actions, text="Назначить IP", command=self.apply_address_plan)
-        self.address_button.pack(side="left", padx=(8, 0))
-        self.default_ip_button = ttk.Button(
-            actions,
-            text="Назначить 192.168.0.250",
-            command=self.apply_default_ip_plan,
-        )
-        self.default_ip_button.pack(side="left", padx=(8, 0))
-        self.export_button = ttk.Button(actions, text="Excel / CSV", command=self.export_inventory)
-        self.export_button.pack(side="left", padx=(8, 0))
-        self.copy_button = ttk.Button(actions, text="Копировать", command=self.copy_table_rows)
-        self.copy_button.pack(side="left", padx=8)
-        # Two rows keep every action reachable on ordinary laptop/server displays.
-        for button in actions.winfo_children():
-            button.pack_forget()
-        for index, button in enumerate((self.select_all_button, self.test_button, self.details_button,
-                                        self.apply_button, self.address_button, self.default_ip_button,
-                                        self.export_button, self.copy_button)):
-            button.grid(row=0, column=index, padx=(0, 6), pady=3, sticky="w")
-        self.status = tk.StringVar(value="Готово")
-        progress_frame = ttk.Frame(self, padding=(12, 4))
-        progress_frame.grid(row=6, column=0, sticky="ew")
-        progress_frame.columnconfigure(0, weight=1)
-        ttk.Label(progress_frame, textvariable=self.status).grid(row=0, column=0, sticky="w")
-        self.progress_bar = ttk.Progressbar(progress_frame, length=160, mode="determinate")
-        self.progress_bar.grid(row=0, column=1, padx=8)
-        self.stop_button = ttk.Button(progress_frame, text="Остановить", command=self._request_stop, state="disabled")
-        self.stop_button.grid(row=0, column=2)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.table.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.table.xview)
+        self.table.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
-        log_frame = ttk.Frame(self, padding=(12, 6, 12, 12))
-        log_frame.grid(row=5, column=0, sticky="nsew")
-        log_frame.rowconfigure(0, weight=1)
-        log_frame.columnconfigure(0, weight=1)
-        self.log = tk.Text(log_frame, height=12, wrap="word", state="disabled")
-        self.log.grid(row=0, column=0, sticky="nsew")
-        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
-        log_scroll.grid(row=0, column=1, sticky="ns")
-        self.log.configure(yscrollcommand=log_scroll.set)
+        self.table.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
 
-    def choose_config(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Выберите конфигурацию",
-            initialdir=str(APP_DIR),
-            filetypes=[("YAML", "*.yaml *.yml"), ("Все файлы", "*.*")],
+        # Table Bindings
+        self.table.bind("<Button-1>", self._on_table_click)
+        self.table.bind("<Button-3>", self._on_table_right_click)
+        self.table.bind("<<TreeviewSelect>>", self._on_table_select)
+        self.table.bind("<space>", self._on_space_toggle)
+
+        # Context Menu
+        self._build_context_menu()
+
+    def _build_bottom_panes(self, parent) -> None:
+        self.bottom_frame = ttk.Frame(parent)
+        parent.add(self.bottom_frame, weight=2)
+        self.bottom_frame.rowconfigure(0, weight=1)
+        self.bottom_frame.columnconfigure(0, weight=1)
+
+        self.h_paned = ttk.PanedWindow(self.bottom_frame, orient="horizontal")
+        self.h_paned.grid(row=0, column=0, sticky="nsew")
+
+        # Bottom Left: Operation Log
+        log_pane = ttk.Frame(self.h_paned)
+        self.h_paned.add(log_pane, weight=3)
+        log_pane.rowconfigure(1, weight=1)
+        log_pane.columnconfigure(0, weight=1)
+
+        log_toolbar = ttk.Frame(log_pane, padding=(4, 2))
+        log_toolbar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(log_toolbar, text="📋 Журнал операций", font=("Segoe UI", 9, "bold")).pack(side="left", padx=2)
+        ttk.Button(log_toolbar, text="🧹 Очистить", width=10, command=self._clear_log).pack(side="left", padx=6)
+        ttk.Button(log_toolbar, text="💾 Сохранить...", width=12, command=self._save_log_dialog).pack(side="left", padx=2)
+        ttk.Checkbutton(log_toolbar, text="Автопрокрутка", variable=self.autoscroll_log).pack(side="right", padx=4)
+
+        self.log = ScrolledText(log_pane, wrap="word", height=8, font=("Consolas", 9), bg="#181a1f", fg="#dcdfe4", insertbackground="white")
+        self.log.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
+        self.log.tag_configure("success", foreground="#98c379")
+        self.log.tag_configure("error", foreground="#e06c75")
+        self.log.tag_configure("warn", foreground="#e5c07b")
+        self.log.tag_configure("info", foreground="#61afef")
+
+        # Bottom Right: Embedded Video Player
+        video_pane = ttk.Frame(self.h_paned)
+        self.h_paned.add(video_pane, weight=2)
+        video_pane.rowconfigure(0, weight=1)
+        video_pane.columnconfigure(0, weight=1)
+
+        self.vlc_player = EmbeddedVlcPlayer(video_pane, on_external_request=self._launch_external_vlc)
+        self.vlc_player.grid(row=0, column=0, sticky="nsew")
+
+    def _build_status_bar(self) -> None:
+        status_frame = ttk.Frame(self, padding=(8, 4))
+        status_frame.grid(row=3, column=0, sticky="ew")
+        status_frame.columnconfigure(0, weight=1)
+
+        self.status = tk.StringVar(value="Готово к работе.")
+        self.status_label = ttk.Label(status_frame, textvariable=self.status, anchor="w")
+        self.status_label.grid(row=0, column=0, sticky="ew")
+
+        self.progress = ttk.Progressbar(status_frame, mode="determinate", length=220)
+        self.progress.grid(row=0, column=1, padx=(12, 12))
+
+        admin_text = "🛡 Администратор" if self._is_admin() else "⚠ Пользователь"
+        admin_fg = "green" if self._is_admin() else "orange"
+        lbl = tk.Label(status_frame, text=admin_text, fg=admin_fg, font=("Segoe UI", 8, "bold"))
+        lbl.grid(row=0, column=2, sticky="e")
+
+    # =========================================================================
+    # CONTEXT MENU & ROW ACTIONS
+    # =========================================================================
+
+    def _build_context_menu(self) -> None:
+        self.row_menu = tk.Menu(self, tearoff=0)
+
+        # Video section
+        self.row_menu.add_command(label="📹 Открыть видео (доп. поток)", command=lambda: self._play_selected_video("sub"))
+        self.row_menu.add_command(label="📹 Открыть видео (основной поток)", command=lambda: self._play_selected_video("main"))
+        self.row_menu.add_command(label="🖥 Открыть во внешнем VLC", command=lambda: self._launch_external_vlc(self._get_active_row()))
+        self.row_menu.add_command(label="🌐 Открыть в браузере", command=self._open_in_browser)
+        self.row_menu.add_separator()
+
+        # Configuration section
+        self.row_menu.add_command(label="⚙ Сетевые настройки камеры...", command=self._open_camera_network_dialog)
+        self.row_menu.add_command(label="🎬 Видеопотоки и кодек...", command=self._open_camera_video_dialog)
+
+        # Submenu: Применить профиль
+        self.profile_submenu = tk.Menu(self.row_menu, tearoff=0)
+        for k, name in profiles_mod.list_profile_items():
+            self.profile_submenu.add_command(
+                label=name,
+                command=lambda pk=k: self._apply_profile_to_camera(self._get_active_row(), pk),
+            )
+        self.row_menu.add_cascade(label="📋 Применить видеопрофиль к камере", menu=self.profile_submenu)
+
+        self.row_menu.add_command(label="🔄 Прочитать / обновить настройки", command=self._read_single_camera_details)
+        self.row_menu.add_command(label="📶 Проверить доступность (Ping)", command=self._ping_single_camera)
+        self.row_menu.add_separator()
+
+        # Clipboard & filter section
+        copy_menu = tk.Menu(self.row_menu, tearoff=0)
+        copy_menu.add_command(label="IP-адрес", command=lambda: self._copy_cell("ip"))
+        copy_menu.add_command(label="MAC-адрес", command=lambda: self._copy_cell("mac"))
+        copy_menu.add_command(label="Всю строку", command=self._copy_row_text)
+        self.row_menu.add_cascade(label="📋 Копировать", menu=copy_menu)
+
+        self.row_menu.add_command(label="🔍 Фильтровать по этому значению", command=self._filter_by_cell)
+        self.row_menu.add_separator()
+        self.row_menu.add_command(label="❌ Убрать из текущего списка", command=self._remove_selected_from_table)
+
+    def _get_active_row(self) -> dict:
+        sel = self.table.selection()
+        if sel:
+            ip = self.table.item(sel[0], "values")[2]  # "ip" column index
+            for r in self.inventory:
+                if r.get("ip") == ip:
+                    return r
+        return self.vlc_player.current_camera
+
+    def _on_table_select(self, _event=None) -> None:
+        sel = self.table.selection()
+        if not sel:
+            return
+        vals = self.table.item(sel[0], "values")
+        if len(vals) > 2:
+            ip = vals[2]
+            for r in self.inventory:
+                if r.get("ip") == ip:
+                    # Update video widget label without auto-playing
+                    self.vlc_player.set_camera(r)
+                    break
+
+    def _on_table_click(self, event) -> None:
+        region = self.table.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        col = self.table.identify_column(event.x)
+        item = self.table.identify_row(event.y)
+        if not item:
+            return
+
+        # Column #1 is 'actions' (⋮)
+        if col == "#1":
+            self.table.selection_set(item)
+            self._show_context_menu(event.x_root, event.y_root)
+            return
+
+        # Column #2 is 'assign' (checkbox)
+        if col == "#2":
+            self._toggle_assign(item)
+            return
+
+    def _on_table_right_click(self, event) -> None:
+        item = self.table.identify_row(event.y)
+        if item:
+            if item not in self.table.selection():
+                self.table.selection_set(item)
+            self._show_context_menu(event.x_root, event.y_root)
+
+    def _show_context_menu(self, x, y) -> None:
+        row = self._get_active_row()
+        if row:
+            self.row_menu.tk_popup(x, y)
+
+    def _on_space_toggle(self, _event=None) -> None:
+        for item in self.table.selection():
+            self._toggle_assign(item)
+
+    def _toggle_assign(self, item) -> None:
+        vals = list(self.table.item(item, "values"))
+        ip = vals[2]
+        for r in self.inventory:
+            if r.get("ip") == ip:
+                r["assign"] = not r.get("assign", False)
+                vals[1] = "☑" if r["assign"] else "☐"
+                self.table.item(item, values=vals)
+                break
+        self._update_counter_label()
+
+    def _set_all_assign(self, state: bool) -> None:
+        visible = self._visible_rows()
+        for r in visible:
+            r["assign"] = state
+        self._render_table()
+
+    # =========================================================================
+    # FILTERING & SEARCH
+    # =========================================================================
+
+    def _on_filter_changed(self) -> None:
+        self._render_table()
+
+    def _clear_filter(self) -> None:
+        self.filter_text.set("")
+        self._render_table()
+
+    def _set_quick_filter(self, key: str) -> None:
+        self.quick_filter = key
+        self._update_chip_styles()
+        self._render_table()
+
+    def _update_chip_styles(self) -> None:
+        for k, btn in self.chip_buttons.items():
+            btn.configure(style="ActiveChip.TButton" if k == self.quick_filter else "FilterChip.TButton")
+
+    def _visible_rows(self) -> list[dict]:
+        query = self.filter_text.get().strip().casefold()
+        qf = self.quick_filter
+        result = []
+        for r in self.inventory:
+            # Quick filter condition
+            if qf == "default_ip" and r.get("ip") != DEFAULT_CAMERA_IP and r.get("current_ip") != DEFAULT_CAMERA_IP:
+                continue
+            if qf == "errors" and "ошибк" not in str(r.get("status", "")).lower() and "fail" not in str(r.get("status", "")).lower():
+                continue
+            if qf == "offline" and r.get("online"):
+                continue
+            if qf == "h264" and "264" not in str(r.get("codec", "")).lower():
+                continue
+            if qf == "h265" and "265" not in str(r.get("codec", "")).lower():
+                continue
+            if qf == "unread" and (r.get("mask") or r.get("gateway_read")):
+                continue
+
+            # Text search condition (matches IP, new_ip, model, mac, serial, status)
+            if query:
+                haystack = f"{r.get('ip','')} {r.get('new_ip','')} {r.get('model','')} {r.get('mac','')} {r.get('serial_number','')} {r.get('device_id','')} {r.get('status','')}".casefold()
+                if query not in haystack:
+                    continue
+
+            result.append(r)
+        return result
+
+    def _render_table(self) -> None:
+        selected_ips = {self.table.item(item, "values")[2] for item in self.table.selection() if len(self.table.item(item, "values")) > 2}
+        self.table.delete(*self.table.get_children())
+        visible = self._visible_rows()
+
+        # Sort if requested
+        if self.sort_column:
+            def sort_key(row):
+                val = row.get(self.sort_column, "")
+                if self.sort_column in ("ip", "new_ip"):
+                    try:
+                        return ipaddress.IPv4Address(val)
+                    except Exception:
+                        return ipaddress.IPv4Address("0.0.0.0")
+                return str(val).lower()
+            visible.sort(key=sort_key, reverse=self.sort_reverse)
+
+        for r in visible:
+            assign_mark = "☑" if r.get("assign") else "☐"
+            serial = r.get("serial_number") or r.get("device_id", "")
+            seen = str(r.get("seen_passes", 0)) if r.get("online") else ""
+            item_id = self.table.insert(
+                "", "end",
+                values=(
+                    "⋮",
+                    assign_mark,
+                    r.get("ip", ""),
+                    r.get("new_ip", ""),
+                    r.get("model", ""),
+                    r.get("mac", ""),
+                    serial,
+                    r.get("mask", ""),
+                    r.get("gateway_read", ""),
+                    r.get("ntp_read", ""),
+                    r.get("timezone_read", ""),
+                    r.get("codec", ""),
+                    r.get("profile", ""),
+                    seen,
+                    r.get("status", ""),
+                ),
+            )
+            if r.get("ip") in selected_ips:
+                self.table.selection_add(item_id)
+
+        self._update_counter_label()
+
+    def _update_counter_label(self) -> None:
+        total = len(self.inventory)
+        shown = len(self._visible_rows())
+        checked = sum(1 for r in self.inventory if r.get("assign"))
+        self.counter_label.configure(text=f"Найдено: {total} | Показано: {shown} | Отмечено: {checked}")
+
+    def _sort_table(self, col: str) -> None:
+        if col in ("actions", "assign"):
+            return
+        if self.sort_column == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_column = col
+            self.sort_reverse = False
+
+        arrow = " ▼" if self.sort_reverse else " ▲"
+        for key, text in self.table_headings.items():
+            self.table.heading(key, text=text + (arrow if key == col else ""))
+        self._render_table()
+
+    def _filter_by_cell(self) -> None:
+        row = self._get_active_row()
+        if row and row.get("ip"):
+            self.filter_text.set(row.get("ip"))
+            self._render_table()
+
+    # =========================================================================
+    # BOTTOM PANE TOGGLE & LOG
+    # =========================================================================
+
+    def _toggle_bottom_pane(self) -> None:
+        if self.bottom_collapsed:
+            self.v_paned.add(self.bottom_frame, weight=2)
+            self.btn_toggle_bottom.configure(text="▼ Скрыть панель")
+            self.bottom_collapsed = False
+        else:
+            self.v_paned.forget(self.bottom_frame)
+            self.btn_toggle_bottom.configure(text="▲ Показать панель")
+            self.bottom_collapsed = True
+
+    def _clear_log(self) -> None:
+        self.log.delete("1.0", "end")
+
+    def _save_log_dialog(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Сохранить журнал операций",
+            defaultextension=".txt",
+            filetypes=[("Текстовый файл", "*.txt"), ("Все файлы", "*.*")],
         )
         if path:
-            self.config_path.set(path)
-            self.load_config()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.log.get("1.0", "end"))
+            self.status.set(f"Журнал сохранён: {path}")
 
-    def load_config(self) -> None:
-        if self.running:
+    # =========================================================================
+    # VIDEO ACTIONS
+    # =========================================================================
+
+    def _play_selected_video(self, stream_type: str = "sub") -> None:
+        row = self._get_active_row()
+        if not row:
+            messagebox.showinfo("Видео", "Сначала выберите камеру в таблице.")
             return
+        if self.bottom_collapsed:
+            self._toggle_bottom_pane()
+        self.vlc_player.play(row, stream_type=stream_type)
+
+    def _launch_external_vlc(self, camera: dict) -> None:
+        if not camera:
+            return
+        vlc_path = find_vlc()
+        if not vlc_path:
+            messagebox.showerror("VLC не найден", "Плеер VLC не найден в системе (C:\\Program Files\\VideoLAN\\VLC\\vlc.exe).")
+            return
+        ip = camera.get("ip")
+        u = camera.get("username", self.default_username.get().strip())
+        p = camera.get("password", self.default_password.get())
         try:
-            path = pathlib.Path(self.config_path.get()).expanduser().resolve()
-            with path.open(encoding="utf-8") as stream:
-                data = yaml.safe_load(stream) or {}
-            cameras = configurator.expand_cameras(data.get("cameras") or [data.get("camera")])
-            cameras = [camera for camera in cameras if camera]
+            uri = stream_uri(ip, u, p, stream_index=0)
+            launch_video(vlc_path, uri, u, p)
+            self.events.put(("log", f"Запущен внешний VLC: {ip}\n"))
         except Exception as exc:
-            messagebox.showerror("Ошибка конфигурации", str(exc))
+            messagebox.showerror("Ошибка VLC", f"Не удалось получить поток RTSP для внешнего VLC: {exc}")
+
+    def _open_in_browser(self) -> None:
+        row = self._get_active_row()
+        if row and row.get("ip"):
+            webbrowser.open(f"http://{row['ip']}")
+
+    # =========================================================================
+    # CLIPBOARD & TABLE MANAGEMENT
+    # =========================================================================
+
+    def _copy_cell(self, field: str) -> None:
+        row = self._get_active_row()
+        if row:
+            val = str(row.get(field, ""))
+            self.clipboard_clear()
+            self.clipboard_append(val)
+            self.status.set(f"Скопировано: {val}")
+
+    def _copy_row_text(self) -> None:
+        row = self._get_active_row()
+        if row:
+            line = "\t".join(f"{k}: {v}" for k, v in row.items() if v and k != "camera")
+            self.clipboard_clear()
+            self.clipboard_append(line)
+            self.status.set("Строка камеры скопирована в буфер.")
+
+    def _remove_selected_from_table(self) -> None:
+        sel = self.table.selection()
+        if not sel:
             return
+        ips_to_remove = {self.table.item(i, "values")[2] for i in sel}
+        self.inventory = [r for r in self.inventory if r.get("ip") not in ips_to_remove]
+        self._render_table()
+        self.status.set(f"Удалено строк: {len(ips_to_remove)}.")
 
-        self.config_data = data
-        self.cameras = cameras
-        # YAML supplies configuration and credentials, never a live device list.
-        self.ntp_server.set(str(data.get("ntp", {}).get("server", "")))
-        self.cross_timezone.set(str(data.get("timezone", {}).get("timezone", "")))
-        network = data.get("network", {})
-        self.network_mask.set(str(network.get("subnet_mask", "255.255.255.0")))
-        self.gateway.set(str(network.get("gateway", "")))
-        self.dns_main.set(str(network.get("dns_main", "")))
-        if cameras:
-            self.default_username.set(str(cameras[0].get("username", "Admin")))
-            self.default_password.set(str(cameras[0].get("password", "")))
-        if self.cross_timezone.get() not in TIMEZONE_VALUES:
-            self.timezone_box.configure(values=[self.cross_timezone.get(), *TIMEZONE_VALUES])
-        self._populate_table()
-        self.status.set("Конфигурация загружена. Для поиска камер нажмите «Сканировать».")
+    def clear_inventory(self) -> None:
+        if self.inventory and messagebox.askyesno("Очистить список", "Очистить текущий список найденных камер?"):
+            self.vlc_player.stop()
+            self.inventory = []
+            self._render_table()
+            self.status.set("Список камер очищен.")
 
-    def _load_projects(self) -> None:
-        names = self.store.list_projects()
-        if not names:
-            self.store.ensure_project("Основной объект")
-            names = ["Основной объект"]
-        self.project_box.configure(values=names)
-        self.project_name.set(names[0])
-        self._load_project(names[0])
+    # =========================================================================
+    # PROFILES & TRAFFIC ESTIMATION
+    # =========================================================================
 
-    def _project_settings(self) -> dict:
-        columns = {key: self.table.column(key, "width") for key in self.table["columns"]}
-        return {
-            "scan_start": self.scan_start.get().strip(),
-            "scan_end": self.scan_end.get().strip(),
-            "interface_ip": self.interface_ip.get().strip(),
-            "vendor_discovery": bool(self.vendor_discovery.get()),
-            "target_start": self.target_start.get().strip(),
-            "target_end": self.target_end.get().strip(),
-            "pass_count": self.pass_count.get(),
-            "network_mask": self.network_mask.get().strip(),
-            "gateway": self.gateway.get().strip(),
-            "dns_main": self.dns_main.get().strip(),
-            "ntp_server": self.ntp_server.get().strip(),
-            "timezone": self.cross_timezone.get().strip(),
-            "operations": {key: bool(value.get()) for key, value in self.operation_vars.items()},
-            "geometry": self.geometry(),
-            "columns": columns,
-        }
+    def _on_profile_selected(self) -> None:
+        k = self.selected_profile_key.get()
+        p = profiles_mod.get_profile(k, self.custom_profiles)
+        self.events.put(("log", f"Выбран видеопрофиль: {p['name']} ({p.get('description','')})\n"))
+        self.status.set(f"Активный видеопрофиль: {p['name']}")
 
-    def _apply_project_settings(self, settings: dict) -> None:
-        variables = {
-            "scan_start": self.scan_start,
-            "scan_end": self.scan_end,
-            "interface_ip": self.interface_ip,
-            "target_start": self.target_start,
-            "target_end": self.target_end,
-            "pass_count": self.pass_count,
-            "network_mask": self.network_mask,
-            "gateway": self.gateway,
-            "dns_main": self.dns_main,
-            "ntp_server": self.ntp_server,
-            "timezone": self.cross_timezone,
-        }
-        for key, variable in variables.items():
-            if key in settings:
-                variable.set(settings[key])
-        if "vendor_discovery" in settings:
-            self.vendor_discovery.set(bool(settings["vendor_discovery"]))
-        # Applying settings is an explicit decision in every new session.
-        for variable in self.operation_vars.values():
-            variable.set(False)
-        for key, width in settings.get("columns", {}).items():
-            if key in self.table["columns"]:
-                self.table.column(key, width=int(width))
-        geometry = settings.get("geometry", "")
-        if geometry:
+    def _open_traffic_dialog(self) -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title("Оценка расчётного сетевого трафика")
+        dlg.geometry("540x440")
+        dlg.transient(self)
+        dlg.grab_set()
+
+        frame = ttk.Frame(dlg, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        checked = [r for r in self._visible_rows() if r.get("assign")]
+        base_count = len(checked) if checked else len(self._visible_rows())
+        count_var = tk.IntVar(value=max(1, base_count))
+        profile_var = tk.StringVar(value=self.selected_profile_key.get())
+
+        row_f = ttk.Frame(frame)
+        row_f.pack(fill="x", pady=4)
+        ttk.Label(row_f, text="Камер в расчёте:").pack(side="left")
+        spin = ttk.Spinbox(row_f, from_=1, to=1000, textvariable=count_var, width=8)
+        spin.pack(side="left", padx=8)
+        if checked:
+            ttk.Label(row_f, text=f"(отмечено: {len(checked)})", font=("Segoe UI", 8, "italic")).pack(side="left")
+        else:
+            ttk.Label(row_f, text=f"(все видимые: {len(self._visible_rows())})", font=("Segoe UI", 8, "italic")).pack(side="left")
+
+        row_p = ttk.Frame(frame)
+        row_p.pack(fill="x", pady=4)
+        ttk.Label(row_p, text="Профиль качества:").pack(side="left")
+        cb = ttk.Combobox(row_p, textvariable=profile_var, values=[k for k, _ in profiles_mod.list_profile_items(self.custom_profiles)], state="readonly", width=18)
+        cb.pack(side="left", padx=8)
+
+        res_frame = ttk.LabelFrame(frame, text="Расчётный битрейт и архив", padding=12)
+        res_frame.pack(fill="both", expand=True, pady=12)
+
+        lbl_main = ttk.Label(res_frame, font=("Segoe UI", 9))
+        lbl_main.pack(anchor="w", pady=2)
+
+        lbl_sub = ttk.Label(res_frame, font=("Segoe UI", 9))
+        lbl_sub.pack(anchor="w", pady=2)
+
+        lbl_total = ttk.Label(res_frame, font=("Segoe UI", 10, "bold"))
+        lbl_total.pack(anchor="w", pady=4)
+
+        lbl_storage = ttk.Label(res_frame, font=("Segoe UI", 9))
+        lbl_storage.pack(anchor="w", pady=2)
+
+        lbl_note = ttk.Label(
+            res_frame,
+            text="⚠️ Внимание: Это теоретический расчёт исходя из битрейта профилей,\nа не физический замер фактического трафика в коммутаторах сети.",
+            font=("Segoe UI", 8, "italic"),
+            foreground="#666666",
+        )
+        lbl_note.pack(anchor="w", pady=(8, 0))
+
+        def update_calc(*_args):
             try:
-                self.geometry(geometry)
-            except tk.TclError:
-                pass
+                c = int(count_var.get())
+            except Exception:
+                c = 1
+            p = profiles_mod.get_profile(profile_var.get(), self.custom_profiles)
+            s = profiles_mod.estimate_traffic_summary(c, p)
+            gb_day = round(s["total_main_mbps"] * 3600 * 24 / 8 / 1000, 1)
+            lbl_main.config(text=f"• Основной поток ({s['main_kbps']} Кбит/с на камеру): ~{s['total_main_mbps']} Мбит/с")
+            lbl_sub.config(text=f"• Дополнительный поток ({s['sub_kbps']} Кбит/с на камеру): ~{s['total_sub_mbps']} Мбит/с")
+            lbl_total.config(text=f"• Суммарная нагрузка на сеть: ~{s['total_both_mbps']} Мбит/с")
+            lbl_storage.config(text=f"• Расчётный архив (осн. поток 24ч): ~{gb_day} ГБ/сутки (~{round(gb_day * 30 / 1000, 2)} ТБ/мес)")
 
-    def _load_project(self, name: str) -> None:
-        settings, cameras = self.store.load_project(name)
-        self.current_project_name = name
-        # Reset missing settings too, so a new object does not inherit another one's network.
-        defaults = {"scan_start": "192.168.0.250", "scan_end": "", "interface_ip": "",
-                    "target_start": "", "target_end": "", "pass_count": "1",
-                    "network_mask": "", "gateway": "", "dns_main": "", "ntp_server": "",
-                    "timezone": "", "vendor_discovery": False}
-        self._apply_project_settings({**defaults, **settings})
-        self.inventory = []
-        self.scan_time = ""
-        self._reset_filters()
-        self.status.set(f"Объект «{name}»: поиск ещё не выполнен. В истории: {len(cameras)}.")
+        count_var.trace_add("write", update_calc)
+        profile_var.trace_add("write", update_calc)
+        update_calc()
 
-    def _save_current_project(self) -> None:
-        if self.current_project_name:
-            self.store.save_project(
-                self.current_project_name,
-                self._project_settings(),
-                self.inventory,
-            )
+        def apply_to_selected():
+            self.selected_profile_key.set(profile_var.get())
+            self._on_profile_selected()
+            p = profiles_mod.get_profile(profile_var.get(), self.custom_profiles)
+            target_rows = checked if checked else self._visible_rows()
+            for r in target_rows:
+                r["profile"] = p["name"]
+            self._render_table()
+            dlg.destroy()
 
-    def _project_changed(self, _event=None) -> None:
+        btn_box = ttk.Frame(dlg, padding=8)
+        btn_box.pack(fill="x")
+        ttk.Button(btn_box, text="Применить профиль к камерам", command=apply_to_selected).pack(side="left", padx=4)
+        ttk.Button(btn_box, text="Закрыть", command=dlg.destroy).pack(side="right", padx=4)
+
+    def _import_profiles_dialog(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Импорт видеопрофилей",
+            filetypes=[("Файлы профилей", "*.yaml *.yml *.json"), ("Все файлы", "*.*")],
+        )
+        if path:
+            try:
+                data = profiles_mod.load_profiles_file(pathlib.Path(path))
+                self.custom_profiles.update(data)
+                messagebox.showinfo("Импорт профилей", f"Успешно импортировано профилей: {len(data)}")
+            except Exception as e:
+                messagebox.showerror("Ошибка импорта", str(e))
+
+    def _export_profiles_dialog(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Экспорт видеопрофилей",
+            defaultextension=".yaml",
+            filetypes=[("YAML файл", "*.yaml"), ("JSON файл", "*.json")],
+        )
+        if path:
+            try:
+                all_profiles = {**profiles_mod.DEFAULT_PROFILES, **self.custom_profiles}
+                profiles_mod.save_profiles_file(pathlib.Path(path), all_profiles)
+                messagebox.showinfo("Экспорт профилей", f"Профили сохранены в {path}")
+            except Exception as e:
+                messagebox.showerror("Ошибка экспорта", str(e))
+
+    def _apply_profile_to_camera(self, camera: dict, profile_key: str) -> None:
+        if not camera:
+            return
+        profile = profiles_mod.get_profile(profile_key, self.custom_profiles)
+        streams = profiles_mod.profile_to_streams_config(profile)
+        config_data = self._runtime_config()
+        config_data["streams"] = streams
+
+        def worker():
+            writer = QueueWriter(self.events)
+            with redirect_stdout(writer), redirect_stderr(writer):
+                self.events.put(("log", f"\n[Видео] Применение профиля «{profile['name']}» к {camera.get('ip')}...\n"))
+                cam_obj = copy.deepcopy(camera.get("camera", camera))
+                cam_obj["ip"] = camera.get("ip")
+                driver = self._make_driver(cam_obj, config_data)
+                try:
+                    if driver.connect():
+                        ok = driver.apply_streams()
+                        camera["codec"] = profile.get("codec", "H264")
+                        self.events.put(("log", f"  ✓ Профиль применён: {'Успешно' if ok else 'Отказ'}\n"))
+                        self.events.put(("refresh", None))
+                    else:
+                        self.events.put(("log", "  ✗ Не удалось подключиться к камере\n"))
+                except Exception as exc:
+                    self.events.put(("log", f"  ✗ Ошибка: {exc}\n"))
+            self.events.put(("done", f"Настройка видео завершена для {camera.get('ip')}"))
+
+        self._start_worker(f"Настройка видео {camera.get('ip')}", worker)
+
+    # =========================================================================
+    # MODAL DIALOGS (SETTINGS, ADDRESS PLAN, HISTORY)
+    # =========================================================================
+
+    def _open_settings_dialog(self) -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title("Параметры работы и сети")
+        dlg.geometry("560x520")
+        dlg.transient(self)
+        dlg.grab_set()
+
+        notebook = ttk.Notebook(dlg, padding=8)
+        notebook.pack(fill="both", expand=True)
+
+        # Tab 1: Network & Scan
+        t1 = ttk.Frame(notebook, padding=12)
+        notebook.add(t1, text="Сеть и поиск")
+
+        ttk.Label(t1, text="Маска подсети:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(t1, textvariable=self.network_mask, width=22).grid(row=0, column=1, sticky="w", pady=4)
+
+        ttk.Label(t1, text="Основной шлюз:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(t1, textvariable=self.gateway, width=22).grid(row=1, column=1, sticky="w", pady=4)
+
+        ttk.Label(t1, text="DNS сервер:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(t1, textvariable=self.dns_main, width=22).grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Separator(t1, orient="horizontal").grid(row=3, column=0, columnspan=2, sticky="ew", pady=10)
+
+        ttk.Label(t1, text="Сканировать от IP:").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Entry(t1, textvariable=self.scan_start, width=22).grid(row=4, column=1, sticky="w", pady=4)
+
+        ttk.Label(t1, text="Сканировать до IP:").grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Entry(t1, textvariable=self.scan_end, width=22).grid(row=5, column=1, sticky="w", pady=4)
+
+        ttk.Label(t1, text="Сетевой интерфейс (IP ПК):").grid(row=6, column=0, sticky="w", pady=4)
+        ttk.Entry(t1, textvariable=self.interface_ip, width=22).grid(row=6, column=1, sticky="w", pady=4)
+
+        ttk.Checkbutton(t1, text="Поиск производителя (Sunell/Uniview мост)", variable=self.vendor_discovery).grid(row=7, column=0, columnspan=2, sticky="w", pady=8)
+
+        # Tab 2: Credentials & Time
+        t2 = ttk.Frame(notebook, padding=12)
+        notebook.add(t2, text="Доступ и время")
+
+        ttk.Label(t2, text="Логин по умолчанию:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(t2, textvariable=self.default_username, width=20).grid(row=0, column=1, sticky="w", pady=4)
+
+        ttk.Label(t2, text="Пароль по умолчанию:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(t2, textvariable=self.default_password, width=20, show="•").grid(row=1, column=1, sticky="w", pady=4)
+
+        ttk.Label(t2, text="Исключения паролей:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(t2, textvariable=self.credential_exceptions, width=32).grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Separator(t2, orient="horizontal").grid(row=3, column=0, columnspan=2, sticky="ew", pady=10)
+
+        ttk.Label(t2, text="NTP сервер:").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Entry(t2, textvariable=self.ntp_server, width=22).grid(row=4, column=1, sticky="w", pady=4)
+
+        ttk.Label(t2, text="Часовой пояс:").grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Combobox(t2, textvariable=self.cross_timezone, values=TIMEZONE_VALUES, state="readonly", width=24).grid(row=5, column=1, sticky="w", pady=4)
+
+        btn_box = ttk.Frame(dlg, padding=(8, 8))
+        btn_box.pack(fill="x")
+        ttk.Button(btn_box, text="Готово", width=12, command=dlg.destroy).pack(side="right", padx=4)
+
+    def _open_history_dialog(self) -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title(f"История объекта «{self.current_project_name}»")
+        dlg.geometry("900x550")
+        dlg.transient(self)
+
+        frame = ttk.Frame(dlg, padding=8)
+        frame.pack(fill="both", expand=True)
+        frame.rowconfigure(1, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(frame)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        _settings, cameras = self.store.load_project(self.current_project_name)
+        ttk.Label(header, text=f"Всего сохранено в базе данных: {len(cameras)} камер", font=("Segoe UI", 9, "bold")).pack(side="left")
+
+        tree = ttk.Treeview(frame, columns=("ip", "model", "mac", "serial", "status", "updated"), show="headings")
+        tree.heading("ip", text="IP адрес")
+        tree.heading("model", text="Модель")
+        tree.heading("mac", text="MAC")
+        tree.heading("serial", text="Серийный номер")
+        tree.heading("status", text="Статус")
+        tree.heading("updated", text="Дата сохранения")
+
+        tree.column("ip", width=120)
+        tree.column("model", width=220)
+        tree.column("mac", width=140)
+        tree.column("serial", width=140)
+        tree.column("status", width=160)
+        tree.column("updated", width=140)
+
+        tree.grid(row=1, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        sb.grid(row=1, column=1, sticky="ns")
+
+        for c in cameras:
+            tree.insert("", "end", values=(
+                c.get("ip",""), c.get("model",""), c.get("mac",""),
+                c.get("serial_number") or c.get("device_id",""),
+                c.get("status",""), c.get("updated_at", c.get("last_seen",""))
+            ))
+
+        btn_box = ttk.Frame(dlg, padding=8)
+        btn_box.pack(fill="x")
+
+        def load_selected_into_current():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Выбор", "Выберите камеры для загрузки в текущую таблицу.")
+                return
+            chosen_ips = {tree.item(i, "values")[0] for i in sel}
+            added = 0
+            for c in cameras:
+                if c.get("ip") in chosen_ips:
+                    if not any(r.get("ip") == c.get("ip") for r in self.inventory):
+                        self.inventory.append(c)
+                        added += 1
+            self._render_table()
+            dlg.destroy()
+            messagebox.showinfo("Загрузка", f"Загружено камер в текущий список: {added}")
+
+        ttk.Button(btn_box, text="Загрузить выбранные в текущий список", command=load_selected_into_current).pack(side="left", padx=4)
+        ttk.Button(btn_box, text="Закрыть", command=dlg.destroy).pack(side="right", padx=4)
+
+    def _open_camera_network_dialog(self) -> None:
+        row = self._get_active_row()
+        if not row:
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Сетевые настройки — {row.get('ip')}")
+        dlg.geometry("380x280")
+        dlg.transient(self)
+        dlg.grab_set()
+
+        frame = ttk.Frame(dlg, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        new_ip_var = tk.StringVar(value=row.get("new_ip") or row.get("ip"))
+        mask_var = tk.StringVar(value=row.get("mask") or self.network_mask.get())
+        gw_var = tk.StringVar(value=row.get("gateway_read") or self.gateway.get())
+        dns_var = tk.StringVar(value=self.dns_main.get())
+
+        ttk.Label(frame, text="Новый IP адрес:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=new_ip_var, width=20).grid(row=0, column=1, sticky="w", pady=4)
+
+        ttk.Label(frame, text="Маска подсети:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=mask_var, width=20).grid(row=1, column=1, sticky="w", pady=4)
+
+        ttk.Label(frame, text="Основной шлюз:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=gw_var, width=20).grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Label(frame, text="DNS сервер:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=dns_var, width=20).grid(row=3, column=1, sticky="w", pady=4)
+
+        def apply_change():
+            row["new_ip"] = new_ip_var.get().strip()
+            row["assign"] = True
+            self._render_table()
+            dlg.destroy()
+
+        ttk.Button(frame, text="Сохранить в план", command=apply_change).grid(row=5, column=0, columnspan=2, pady=16)
+
+    def _open_camera_video_dialog(self) -> None:
+        row = self._get_active_row()
+        if not row:
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Видео и кодек — {row.get('ip')}")
+        dlg.geometry("420x300")
+        dlg.transient(self)
+        dlg.grab_set()
+
+        frame = ttk.Frame(dlg, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        codec_var = tk.StringVar(value=row.get("codec") or "H264")
+        res_var = tk.StringVar(value="1920x1080")
+        fps_var = tk.StringVar(value="15")
+        bitrate_var = tk.StringVar(value="3000")
+
+        ttk.Label(frame, text="Кодек:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Combobox(frame, textvariable=codec_var, values=["H264", "H265"], state="readonly", width=18).grid(row=0, column=1, sticky="w", pady=4)
+
+        ttk.Label(frame, text="Разрешение:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Combobox(frame, textvariable=res_var, values=["2560x1440", "1920x1080", "1280x720"], state="readonly", width=18).grid(row=1, column=1, sticky="w", pady=4)
+
+        ttk.Label(frame, text="Частота кадров (FPS):").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Combobox(frame, textvariable=fps_var, values=["10", "15", "20", "25"], state="readonly", width=18).grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Label(frame, text="Битрейт (Кбит/с):").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=bitrate_var, width=20).grid(row=3, column=1, sticky="w", pady=4)
+
+        def apply_video():
+            custom_p = {
+                "id": "single_custom",
+                "name": "Индивидуальный",
+                "codec": codec_var.get(),
+                "main": {
+                    "id": 1, "name": "stream1", "enabled": True,
+                    "resolution": res_var.get(), "fps": int(fps_var.get()),
+                    "codec": codec_var.get(), "bitrate": int(bitrate_var.get()),
+                    "bitrate_type": "CBR", "gop": int(fps_var.get()) * 2, "quality": 5,
+                },
+                "sub": {
+                    "id": 2, "name": "stream2", "enabled": True,
+                    "resolution": "720x576", "fps": 10,
+                    "codec": codec_var.get(), "bitrate": 512,
+                    "bitrate_type": "CBR", "gop": 20, "quality": 4,
+                },
+            }
+            dlg.destroy()
+            self._apply_profile_to_camera(row, "custom")
+
+        ttk.Button(frame, text="Применить к камере", command=apply_video).grid(row=5, column=0, columnspan=2, pady=16)
+
+    # =========================================================================
+    # BACKEND WORKERS & PIPELINES
+    # =========================================================================
+
+    def start_scan(self) -> None:
         if self.running:
             return
-        name = self.project_name.get().strip()
-        if not name or name == self.current_project_name:
-            return
-        self._save_current_project()
-        self._load_project(name)
+        self.btn_scan.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.cancel_requested.clear()
+        self.running = True
+        self.status.set("Поиск камер в сети...")
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(10)
 
-    def _new_project(self) -> None:
-        if self.running:
-            return
-        name = simpledialog.askstring("Новый объект", "Название объекта:", parent=self)
-        if not name:
-            return
-        name = name.strip()
-        if name in self.store.list_projects():
-            messagebox.showwarning("Объект существует", "Объект с таким названием уже создан.")
-            return
-        self._save_current_project()
-        self.store.ensure_project(name)
-        names = self.store.list_projects()
-        self.project_box.configure(values=names)
-        self.project_name.set(name)
-        self.inventory = []
-        self._load_project(name)
+        # Fast scan: do not auto deep-read settings or open streams
+        threading.Thread(target=self._scan_worker, daemon=True).start()
 
-    def _delete_project(self) -> None:
-        if self.running:
-            return
-        name = self.project_name.get().strip()
-        if not name or not messagebox.askyesno(
-            "Удалить объект", f"Удалить объект «{name}» и его сохраненный список камер?"
-        ):
-            return
-        self.store.delete_project(name)
-        self.current_project_name = ""
-        self.inventory = []
-        self._load_projects()
+    def _scan_worker(self) -> None:
+        start_time = time.monotonic()
+        writer = QueueWriter(self.events)
+        with redirect_stdout(writer), redirect_stderr(writer):
+            self.events.put(("log", "\n=== Запуск быстрого поиска камер ===\n"))
+            vendor_rows = []
+            if self.vendor_discovery.get():
+                try:
+                    self.events.put(("status", "Фирменный опрос оборудования..."))
+                    vendor_rows = self._run_vendor_discovery(
+                        timeout=3.0,
+                        sunell_only=False,
+                        interface_ip=self.interface_ip.get().strip(),
+                    )
+                    self.events.put(("log", f"Фирменный протокол обнаружил: {len(vendor_rows)} камер\n"))
+                except Exception as exc:
+                    self.events.put(("log", f"Ошибка поиска производителя: {exc}\n"))
 
-    def _on_close(self) -> None:
-        if self.running:
-            messagebox.showinfo("Операция выполняется", "Дождитесь завершения текущей операции перед закрытием.")
-            return
-        self._save_current_project()
-        self.store.close()
-        self.destroy()
+            # Build initial items
+            new_items = []
+            for vr in vendor_rows:
+                ip = vr.get("current_ip")
+                if not ip:
+                    continue
+                camera = self._camera_template_for_ip(ip)
+                profile = self._profile_for_vendor_row(vr, camera.get("profile", "cross"))
+                camera["profile"] = profile
+                item = {
+                    "ip": ip,
+                    "assign": False,
+                    "new_ip": vr.get("new_ip", ""),
+                    "model": vr.get("model", ""),
+                    "mac": vr.get("mac", ""),
+                    "device_id": vr.get("device_id", ""),
+                    "serial_number": vr.get("serial_number", ""),
+                    "mask": vr.get("mask", ""),
+                    "gateway_read": vr.get("gateway", ""),
+                    "ntp_read": "",
+                    "timezone_read": "",
+                    "codec": "",
+                    "profile": profile,
+                    "status": vr.get("protocol", "производитель"),
+                    "seen_passes": 1,
+                    "online": True,
+                    "camera": camera,
+                    "vendor_row": vr,
+                }
+                new_items.append(item)
 
-    def _inventory_from_camera(self, camera: dict) -> dict:
+            # Fast probe range for ONVIF / LAPI if specified and different
+            start_ip_text = self.scan_start.get().strip()
+            end_ip_text = self.scan_end.get().strip()
+            if start_ip_text and end_ip_text:
+                try:
+                    s_addr = int(ipaddress.IPv4Address(start_ip_text))
+                    e_addr = int(ipaddress.IPv4Address(end_ip_text))
+                    if e_addr >= s_addr:
+                        target_ips = [str(ipaddress.IPv4Address(val)) for val in range(s_addr, min(e_addr + 1, s_addr + 255))]
+                        # Exclude already found
+                        found_ips = {it["ip"] for it in new_items}
+                        probe_ips = [ip for ip in target_ips if ip not in found_ips]
+                        if probe_ips:
+                            self.events.put(("status", f"Быстрая проверка диапазона {len(probe_ips)} адресов..."))
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+                                futures = {pool.submit(self._probe_fast_ip, ip): ip for ip in probe_ips}
+                                for f in concurrent.futures.as_completed(futures):
+                                    if self.cancel_requested.is_set():
+                                        break
+                                    res = f.result()
+                                    if res:
+                                        new_items.append(res)
+                except Exception as exc:
+                    self.events.put(("log", f"Диапазон IP пропущен: {exc}\n"))
+
+        elapsed = round(time.monotonic() - start_time, 1)
+        self.events.put(("merge_scan", new_items))
+        self.events.put(("done", f"Поиск завершён за {elapsed}с. Найдено камер: {len(new_items)}."))
+
+    def _probe_fast_ip(self, ip: str) -> dict:
+        """Fast non-blocking probe for a single IP address."""
+        if not self._host_replies(ip):
+            return None
+        camera = self._camera_template_for_ip(ip)
+        # Fast port check
         return {
-            "ip": camera.get("ip", ""),
+            "ip": ip,
             "assign": False,
             "new_ip": "",
-            "model": camera.get("model", camera.get("name", "")),
-            "mac": camera.get("mac", ""),
-            "device_id": camera.get("device_id", ""),
-            "serial_number": camera.get("serial_number", ""),
+            "model": "IP Camera",
+            "mac": "",
+            "device_id": "",
+            "serial_number": "",
             "mask": "",
             "gateway_read": "",
             "ntp_read": "",
             "timezone_read": "",
             "codec": "",
             "profile": camera.get("profile", "cross"),
-            "status": "из конфигурации",
-            "seen_passes": 0,
-            "online": False,
+            "status": "онлайн (ping)",
+            "seen_passes": 1,
+            "online": True,
             "camera": camera,
-            "vendor_row": None,
         }
 
-    def _populate_table(self) -> None:
-        old_rows = getattr(self, "_display_rows", {})
-        selected = {id(old_rows[item]) for item in self.table.selection() if item in old_rows}
-        self._display_rows = {}
-        for item in self.table.get_children():
-            self.table.delete(item)
-        for index, row in enumerate(self.inventory):
-            if not self._matches_filter(row):
-                row["assign"] = False
-                row["new_ip"] = ""
-                continue
-            self._display_rows[str(index)] = row
-            self.table.insert(
-                "",
-                "end",
-                iid=str(index),
-                values=(
-                    "☑" if row.get("assign") else "☐",
-                    row.get("ip", ""),
-                    row.get("new_ip", ""),
-                    row.get("model", ""),
-                    row.get("mac", ""),
-                    row.get("serial_number") or row.get("device_id", ""),
-                    row.get("mask", "") or "не прочитана",
-                    row.get("gateway_read", "") or "не прочитан",
-                    row.get("ntp_read", "") or "не прочитан",
-                    row.get("timezone_read", "") or "не прочитан",
-                    row.get("codec", "") or "не прочитан",
-                    row.get("profile", "cross"),
-                    f"{row.get('seen_passes', 0)}/{SCAN_PASSES}" if row.get("online") else "—",
-                    row.get("status", ""),
-                ),
-            )
-            if id(row) in selected:
-                self.table.selection_add(str(index))
+    def _probe_onvif(self, ip: str, username: str = None, password: str = None) -> tuple[bool, str, dict]:
+        """Wrapper around camera_inventory_reader.probe_onvif_camera."""
+        u = username or self.default_username.get().strip()
+        p = password or self.default_password.get()
+        return probe_onvif_camera(ip, u, p)
 
-        shown = len(self.table.get_children())
-        marked = sum(bool(row.get("assign")) for row in self._visible_rows())
-        filters = "; ".join(f"{self.table_headings.get(k, k)}: {v}" for k, v in self.column_filters.items())
-        stamp = f"Поиск: {self.scan_time}" if self.scan_time else "Поиск ещё не выполнен"
-        self.table_summary.set(f"Показано {shown} из {len(self.inventory)} · Отмечено: {marked} · {stamp}" + (f" · Фильтры: {filters}" if filters else ""))
+    # =========================================================================
+    # SEQUENTIAL ASSIGNMENT FROM 192.168.0.250 (TESTED & STABLE)
+    # =========================================================================
 
-    def _sort_value(self, row: dict, column: str):
-        values = {
-            "assign": row.get("assign", False),
-            "ip": row.get("ip", ""),
-            "new_ip": row.get("new_ip", ""),
-            "model": row.get("model", ""),
-            "mac": row.get("mac", ""),
-            "serial": row.get("serial_number") or row.get("device_id", ""),
-            "mask": row.get("mask", ""),
-            "gateway_read": row.get("gateway_read", ""),
-            "ntp_read": row.get("ntp_read", ""),
-            "timezone_read": row.get("timezone_read", ""),
-            "codec": row.get("codec", ""),
-            "profile": row.get("profile", "cross"),
-            "seen": row.get("seen_passes", 0) if row.get("online") else "",
-            "status": row.get("status", ""),
-        }
-        value = values.get(column, "")
-        if isinstance(value, bool):
-            return (0, (0, int(value)))
-        if isinstance(value, (int, float)):
-            return (0, (0, value))
-        text = str(value).strip()
-        if not text:
-            return (1, (0, 0))
-        try:
-            return (0, (0, int(ipaddress.ip_address(text))))
-        except ValueError:
-            parts = tuple(int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", text))
-            return (0, (1, parts))
-
-    def _sort_table(self, column: str) -> None:
+    def apply_default_network_plan(self) -> None:
         if self.running:
             return
-        selected_rows = {
-            id(self.inventory[int(item)])
-            for item in self.table.selection()
-            if item.isdigit() and int(item) < len(self.inventory)
-        }
-        if self.sort_column == column:
-            self.sort_reverse = not self.sort_reverse
-        else:
-            self.sort_column = column
-            self.sort_reverse = False
-
-        present = []
-        empty = []
-        for row in self.inventory:
-            key = self._sort_value(row, column)
-            (empty if key[0] else present).append((key[1], row))
-        present.sort(key=lambda item: item[0], reverse=self.sort_reverse)
-        self.inventory[:] = [row for _, row in present] + [row for _, row in empty]
-
-        for key, label in self.table_headings.items():
-            marker = " ▲" if key == column and not self.sort_reverse else " ▼" if key == column else ""
-            self.table.heading(key, text=label + marker)
-        self._populate_table()
-        for index, row in enumerate(self.inventory):
-            if id(row) in selected_rows and self.table.exists(str(index)):
-                self.table.selection_add(str(index))
-
-    def select_all(self) -> None:
-        if self.running:
+        assigned_rows = [row for row in self._visible_rows() if row.get("assign") and row.get("new_ip")]
+        if not assigned_rows:
+            messagebox.showwarning("Нет плана", "Сначала выберите камеры и укажите новые адреса («Сформировать план»).")
             return
-        rows = self._visible_rows()
-        should_mark = any(not row.get("assign") for row in rows)
-        for row in rows:
-            row["assign"] = should_mark
-        self._populate_table()
-        self.select_all_button.configure(text="Снять отметки" if should_mark else "Отметить все")
 
-    def _table_click(self, event) -> None:
-        if self.running:
+        # Confirmation with preview
+        p = profiles_mod.get_profile(self.selected_profile_key.get(), self.custom_profiles)
+        video_note = f"Включено («{p['name']}»)" if self.apply_video_profile.get() else "Отключено (без изменений)"
+        preview = "\n".join(f"192.168.0.250  →  {r['new_ip']}" for r in assigned_rows[:6])
+        if len(assigned_rows) > 6:
+            preview += f"\n... ещё {len(assigned_rows) - 6}"
+
+        if not messagebox.askyesno(
+            "Назначить 192.168.0.250",
+            f"Камер к обработке: {len(assigned_rows)}\n"
+            f"Применение видеопрофиля: {video_note}\n\n"
+            f"План перевода:\n{preview}\n\n"
+            f"Программа будет последовательно настраивать каждую появляющуюся на 192.168.0.250 камеру, "
+            f"устанавливать время/NTP и переводить на новый IP. Начать?",
+        ):
             return
-        if self.table.identify_region(event.x, event.y) != "cell":
-            return
-        if self.table.identify_column(event.x) != "#1":
-            return
-        item = self.table.identify_row(event.y)
-        if not item:
-            return
-        row = self.inventory[int(item)]
-        row["assign"] = not row.get("assign", False)
-        self._populate_table()
 
-    def copy_table_rows(self, event=None):
-        if not self.inventory:
-            if event is None:
-                messagebox.showwarning("Список пуст", "Нет данных для копирования.")
-            return "break" if event is not None else None
+        self._start_worker("Назначение с 192.168.0.250", self._default_ip_worker, assigned_rows)
 
-        items = list(self.table.selection())
-        if not items:
-            items = [item for item in self.table.get_children() if self.inventory[int(item)].get("assign")]
-        if not items:
-            items = list(self.table.get_children())
-        items.sort(key=self.table.index)
-
-        columns = list(self.table["columns"])
-        lines = ["\t".join(self.table_headings[column] for column in columns)]
-        for item in items:
-            values = self.table.item(item, "values")
-            lines.append(
-                "\t".join(
-                    str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
-                    for value in values
-                )
-            )
-        self.clipboard_clear()
-        self.clipboard_append("\r\n".join(lines))
-        self.update_idletasks()
-        self.status.set(f"Скопировано строк: {len(items)}")
-        return "break" if event is not None else None
-
-    def _open_camera_web(self, event) -> None:
-        item = self.table.identify_row(event.y)
-        if not item:
-            return
-        ip = self.inventory[int(item)].get("ip", "")
-        try:
-            ipaddress.IPv4Address(ip)
-        except ipaddress.AddressValueError:
-            return
-        webbrowser.open_new_tab(f"http://{ip}")
-        self.status.set(f"Открыта камера: {ip}")
-
-    def selected_cameras(self) -> list[dict]:
-        marked = [row["camera"] for row in self._visible_rows() if row.get("assign")]
-        if marked:
-            return marked
-        return [self.inventory[int(item)]["camera"] for item in self.table.selection()]
-
-
-    def _matches_filter(self, row):
-        return matches(row, self.filter_text.get(), self.filter_fields.get(self.filter_field.get(), ""), self.column_filters)
-
-    def _visible_rows(self):
-        return [self.inventory[int(item)] for item in self.table.get_children()]
-
-    def _filter_changed(self, *_args):
-        for row in self.inventory:
-            if not self._matches_filter(row):
-                row["assign"] = False
-                row["new_ip"] = ""
-        self._populate_table()
-
-    def _reset_filters(self):
-        self.column_filters.clear()
-        self.filter_text.set("")
-        self.filter_field.set("Все поля")
-        self._populate_table()
-
-    def _context_menu(self, event):
-        region = self.table.identify_region(event.x, event.y)
-        if region == "heading":
-            column = int(self.table.identify_column(event.x)[1:]) - 1
-            key = self.table["columns"][column]
-            if key == "assign" or self.running:
-                return "break"
-            value = simpledialog.askstring("Фильтр по столбцу", self.table_headings[key] + " содержит (пусто — сбросить):",
-                                           initialvalue=self.column_filters.get(key, ""), parent=self)
-            if value is not None:
-                if value.strip():
-                    self.column_filters[key] = value.strip()
-                else:
-                    self.column_filters.pop(key, None)
-                self._filter_changed()
-            return "break"
-        item = self.table.identify_row(event.y)
-        if not item:
-            return "break"
-        if item not in self.table.selection():
-            self.table.selection_set(item)
-        self.table.focus(item)
-        self.context_menu.entryconfigure(0, state="disabled" if self.running or self.video_pending else "normal")
-        self.context_menu.entryconfigure(3, state="disabled" if self.running else "normal")
-        try:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.context_menu.grab_release()
-        return "break"
-
-    def _focused_row(self):
-        item = self.table.focus()
-        if item and self.table.exists(item):
-            return self.inventory[int(item)]
-        return None
-
-    def _open_selected_web(self):
-        row = self._focused_row()
-        if row:
-            try:
-                ip = str(ipaddress.IPv4Address(row["ip"]))
-            except ValueError:
-                return
-            webbrowser.open_new_tab(f"http://{ip}")
-
-    def _open_video(self):
-        row = self._focused_row()
-        if not row or self.running or self.video_pending or not self._prepare_credentials():
-            return
-        vlc = find_vlc()
-        if not vlc:
-            vlc = filedialog.askopenfilename(title="Укажите vlc.exe для просмотра видео", filetypes=[("VLC", "vlc.exe")])
-        if not vlc:
-            return
-        ip = row["ip"]
-        username, password = self._credential_for_ip(ip, self.active_credential_rules,
-                                                   (self.default_username.get().strip(), self.default_password.get()))
-        self.video_pending = True
-        self.status.set(f"Получение видеопотока {ip}…")
-        def worker():
-            try:
-                uri = stream_uri(ip, username, password)
-                self.events.put(("video_ready", (vlc, uri, username, password)))
-            except Exception:
-                self.events.put(("video_failed", (vlc, ip, username, password)))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _remove_selected(self):
-        if self.running:
-            return
-        selected = {int(item) for item in self.table.selection()}
-        if not selected:
-            return
-        rows = [row for index, row in enumerate(self.inventory) if index in selected]
-        self.store.remove_cameras(self.current_project_name, rows)
-        self.inventory = [row for index, row in enumerate(self.inventory) if index not in selected]
-        self._save_current_project()
-        self._populate_table()
-        self.status.set(f"Убрано из списка: {len(rows)}. Повторный поиск может обнаружить их снова.")
-
-    def _show_history(self):
-        if self.running:
-            return
-        self._save_current_project()
-        _, rows = self.store.load_project(self.current_project_name)
-        project_name = self.current_project_name
-        window = tk.Toplevel(self)
-        window.title(f"История — {self.current_project_name}")
-        window.geometry("1000x500")
-        ttk.Label(window, text="Сохранённые наблюдения. Доступность сейчас не проверена; настройки из этого окна не применяются.", padding=10).pack(anchor="w")
-        frame = ttk.Frame(window)
-        frame.pack(fill="both", expand=True)
-        table = ttk.Treeview(frame, columns=("ip", "model", "mac", "seen", "status"), show="headings")
-        for key, label in (("ip", "IP"), ("model", "Модель"), ("mac", "MAC"), ("seen", "Последний ответ"), ("status", "Последний статус")):
-            table.heading(key, text=label)
-            table.column(key, width=180)
-        bar = ttk.Scrollbar(frame, orient="vertical", command=table.yview)
-        table.configure(yscrollcommand=bar.set)
-        bar.pack(side="right", fill="y")
-        table.pack(fill="both", expand=True)
-        for row in rows:
-            table.insert("", "end", values=(row.get("ip", ""), row.get("model", ""), row.get("mac", ""), row.get("last_seen", ""), row.get("status", "")))
-        def export_history():
-            path = filedialog.asksaveasfilename(parent=window, title="Экспорт истории", initialfile="История_камер.xlsx", defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
-            if path:
-                try:
-                    export_rows(path, rows, project_name, "История — доступность не проверена")
-                except Exception as exc:
-                    messagebox.showerror("Экспорт", str(exc), parent=window)
-        ttk.Button(window, text="Выгрузить историю в Excel", command=export_history).pack(pady=8)
-
-    def _lock_controls(self, locked):
-        # Freeze object/configuration/selection during worker mutations.
-        if locked:
-            self._locked_controls = []
-            def visit(parent):
-                for widget in parent.winfo_children():
-                    if isinstance(widget, (ttk.Button, ttk.Entry, ttk.Combobox, ttk.Checkbutton)):
-                        state = str(widget.cget("state"))
-                        self._locked_controls.append((widget, state))
-                        widget.configure(state="disabled")
-                    visit(widget)
-            visit(self)
-        else:
-            for widget, state in getattr(self, "_locked_controls", []):
-                if widget.winfo_exists():
-                    widget.configure(state=state)
-            self._locked_controls = []
-
-    def _parse_credential_rules(self) -> list[tuple[int, int, str, str]]:
-        rules = []
-        for item in self.credential_exceptions.get().split(";"):
-            item = item.strip()
-            if not item:
-                continue
-            target, separator, credential = item.partition("=")
-            if not separator or ":" not in credential:
-                raise ValueError(
-                    "Исключения задаются так: 10.53.240.123-10.53.240.125=admin:пароль"
-                )
-            username, password = credential.split(":", 1)
-            start_text, dash, end_text = target.strip().partition("-")
-            start = int(ipaddress.IPv4Address(start_text.strip()))
-            end = int(ipaddress.IPv4Address(end_text.strip())) if dash else start
-            if end < start or not username.strip():
-                raise ValueError(f"Некорректное исключение: {item}")
-            rules.append((start, end, username.strip(), password))
-        return rules
-
-    @staticmethod
-    def _credential_for_ip(
-        ip: str,
-        rules: list[tuple[int, int, str, str]],
-        default: tuple[str, str],
-    ) -> tuple[str, str]:
-        value = int(ipaddress.IPv4Address(ip))
-        for start, end, username, password in rules:
-            if start <= value <= end:
-                return username, password
-        return default
-
-    def _prepare_credentials(self) -> bool:
-        try:
-            self.active_credential_rules = self._parse_credential_rules()
-        except ValueError as exc:
-            messagebox.showerror("Ошибка исключений доступа", str(exc))
-            return False
-        return True
-
-    def start_scan(self) -> None:
-        if self.running:
-            return
-        if not self._prepare_credentials():
-            return
-        vendor_mode = bool(self.vendor_discovery.get())
-        start = end = None
-        if not vendor_mode:
-            try:
-                start = ipaddress.IPv4Address(self.scan_start.get().strip())
-                end_text = self.scan_end.get().strip()
-                end = ipaddress.IPv4Address(end_text) if end_text else start
-                if int(end) < int(start):
-                    raise ValueError("Конечный адрес меньше начального.")
-                if int(end) - int(start) > 65535:
-                    raise ValueError("Диапазон слишком большой.")
-            except ValueError as exc:
-                messagebox.showerror("Ошибка диапазона", str(exc))
-                return
-        self._save_current_project()
-        self.inventory = []
-        self.scan_time = dt.datetime.now().isoformat(timespec="seconds")
-        self._reset_filters()
-        self._start_worker(
-            "Сканирование: проход 1/3",
-            self._scan_worker,
-            start,
-            end,
-            vendor_mode,
-            self.default_username.get().strip(),
-            self.default_password.get(),
-            list(self.active_credential_rules),
-        )
-
-    def _camera_template_for_ip(self, ip: str) -> dict:
-        for camera in self.cameras:
-            if camera.get("ip") == ip:
-                return copy.deepcopy(camera)
-        if self.cameras:
-            camera = copy.deepcopy(self.cameras[0])
-            camera["ip"] = ip
-        else:
-            camera = {"ip": ip, "profile": "cross"}
-        camera["username"] = self.default_username.get().strip()
-        camera["password"] = self.default_password.get()
-        return camera
-
-    @staticmethod
-    def _host_replies(ip: str) -> bool:
-        startup = subprocess.STARTUPINFO()
-        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        result = subprocess.run(
-            ["ping", "-n", "1", "-w", "500", ip],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            startupinfo=startup,
-            check=False,
-        )
-        if result.returncode == 0:
-            return True
-        try:
-            with socket.create_connection((ip, 80), timeout=0.5):
+    def _wait_for_default_ip(self, max_wait: float = 120.0) -> bool:
+        """Wait until DEFAULT_CAMERA_IP responds to ping, allowing cameras to boot or switch to update ARP."""
+        start = time.monotonic()
+        while not self.cancel_requested.is_set():
+            self._flush_arp(DEFAULT_CAMERA_IP)
+            if self._host_replies(DEFAULT_CAMERA_IP):
                 return True
-        except OSError:
-            return False
+            elapsed = int(time.monotonic() - start)
+            if max_wait > 0 and elapsed >= max_wait:
+                return False
+            self.events.put(("status", f"Ожидание камеры на {DEFAULT_CAMERA_IP}... ({elapsed}с, нажмите «Остановить» для выхода)"))
+            self.cancel_requested.wait(2.0)
+        return False
 
-    def _scan_worker(
-        self, start, end, vendor_mode: bool, username: str, password: str, credential_rules: list
-    ) -> None:
-        found_by_identity = {}
-        seen_in_passes = {}
-        addresses = []
-        if not vendor_mode:
-            addresses = [str(ipaddress.IPv4Address(value)) for value in range(int(start), int(end) + 1)]
-
-        for pass_number in range(1, SCAN_PASSES + 1):
-            mode_name = "Поиск производителя" if vendor_mode else "Сканирование диапазона"
-            self.events.put(("status", f"{mode_name}: проход {pass_number}/{SCAN_PASSES}"))
-            alive = set()
-            if addresses:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, len(addresses))) as pool:
-                    alive = {ip for ip, replies in zip(addresses, pool.map(self._host_replies, addresses)) if replies}
-
-            vendor_rows = []
-            if vendor_mode:
-                try:
-                    vendor_rows = self._run_vendor_discovery()
-                except Exception as exc:
-                    self.events.put(("log", f"Проход {pass_number}: ошибка поиска производителя: {exc}\n"))
-                    vendor_rows = []
-                if alive:
-                    vendor_ips = {row.get("current_ip", "") for row in vendor_rows}
-                    missing_ips = sorted(alive - vendor_ips, key=lambda value: int(ipaddress.IPv4Address(value)))
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, max(1, len(missing_ips)))) as pool:
-                        futures = {
-                            pool.submit(
-                                probe_onvif_camera,
-                                ip,
-                                *self._credential_for_ip(ip, credential_rules, (username, password)),
-                                4.0,
-                            ): ip
-                            for ip in missing_ips
-                        }
-                        direct_rows = []
-                        for future in concurrent.futures.as_completed(futures):
-                            try:
-                                row = future.result()
-                            except Exception:
-                                row = None
-                            if row:
-                                direct_rows.append(row)
-                        vendor_rows.extend(direct_rows)
-                    self.events.put(("log", f"Проход {pass_number}: прямой ONVIF={len(direct_rows)}\n"))
-            else:
-                # Обычное сканирование диапазона IP (без мультикаст-поиска производителя)
-                if alive:
-                    alive_ips = sorted(alive, key=lambda value: int(ipaddress.IPv4Address(value)))
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, max(1, len(alive_ips)))) as pool:
-                        futures = {
-                            pool.submit(
-                                probe_onvif_camera,
-                                ip,
-                                *self._credential_for_ip(ip, credential_rules, (username, password)),
-                                3.0,
-                            ): ip
-                            for ip in alive_ips
-                        }
-                        direct_rows = []
-                        for future in concurrent.futures.as_completed(futures):
-                            ip = futures[future]
-                            try:
-                                row = future.result()
-                            except Exception:
-                                row = None
-                            if row:
-                                direct_rows.append(row)
-                            else:
-                                direct_rows.append({
-                                    "selected": "1",
-                                    "protocol": "ip",
-                                    "current_ip": ip,
-                                    "new_ip": "",
-                                    "model": "Сетевое устройство",
-                                    "mac": "",
-                                    "device_id": "",
-                                    "serial_number": "",
-                                    "device_name": "",
-                                    "manufacturer": "",
-                                    "firmware": "",
-                                    "http_port": "80",
-                                    "mask": "",
-                                    "gateway": "",
-                                    "dns": "",
-                                    "status": "отвечает (ping/HTTP)",
-                                    "message": "",
-                                    "raw_attributes": "{}",
-                                })
-                        vendor_rows.extend(direct_rows)
-
-            pass_identities = set()
-            for vendor_row in vendor_rows:
-                ip = vendor_row.get("current_ip", "")
-                if addresses and (ip not in alive or ip not in addresses):
-                    continue
-                identity = camera_identity(vendor_row)
-                existing = found_by_identity.get(identity)
-                if existing is None or (
-                    vendor_row.get("protocol", "").lower() == "sunell"
-                    and existing.get("protocol", "").lower() != "sunell"
-                ):
-                    found_by_identity[identity] = vendor_row
-                pass_identities.add(identity)
-            for identity in pass_identities:
-                seen_in_passes[identity] = seen_in_passes.get(identity, 0) + 1
-            ping_text = f", ping/HTTP={len(alive)}" if addresses else ""
-            self.events.put(("log", f"Проход {pass_number}: камер={len(pass_identities)}{ping_text}\n"))
-            if pass_number < SCAN_PASSES:
-                time.sleep(1)
-
-        found = self._inventory_from_vendor_rows(found_by_identity.values())
-        for row in found:
-            row["seen_passes"] = seen_in_passes.get(camera_identity(row), 0)
-            row["online"] = True
-            row["status"] = f"в сети, ответов {row['seen_passes']}/{SCAN_PASSES}"
-            row["last_seen"] = dt.datetime.now().isoformat(timespec="seconds")
-        found.sort(key=lambda row: (int(ipaddress.IPv4Address(row["ip"])), row["mac"]))
-        self.events.put(("inventory_merge", found))
-
-        if found:
-            self.events.put(("status", f"Найдено {len(found)}. Читаю настройки камер..."))
-            self._read_details_rows(found, username, password, credential_rules)
-        self.events.put(("done", f"Сканирование завершено: сейчас в сети {len(found)}"))
-
-    def _read_details_rows(self, rows: list[dict], username: str, password: str, credential_rules: list) -> None:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(rows)))) as pool:
-            futures = {
-                pool.submit(
-                    read_camera_settings,
-                    row,
-                    *self._credential_for_ip(row["ip"], credential_rules, (username, password)),
-                    5.0,
-                ): camera_identity(row)
-                for row in rows
-            }
-            for future in concurrent.futures.as_completed(futures):
-                identity = futures[future]
-                try:
-                    details = future.result()
-                except Exception as exc:
-                    details = {"details_status": "failed", "details_message": str(exc)}
-                self.events.put(("details", (identity, details)))
-
-    def refresh_details(self) -> None:
-        if self.running:
-            return
-        if not self._prepare_credentials():
-            return
-        rows = [row for row in self._visible_rows() if row.get("assign")]
-        if not rows and self.table.selection():
-            rows = [self.inventory[int(item)] for item in self.table.selection()]
-        if not rows:
-            rows = [row for row in self._visible_rows() if row.get("online")]
-        if not rows:
-            messagebox.showwarning("Нет доступных камер", "Сначала выполните сканирование.")
-            return
-        # Preserve the previous reading in history, then clear values before retrying.
-        self._save_current_project()
-        for row in rows:
-            clear_readings(row)
-            vendor = row.get("vendor_row")
-            if vendor:
-                vendor["mask"] = ""
-                vendor["gateway"] = ""
-            row["status"] = "чтение настроек"
-        self._populate_table()
-        self._start_worker(
-            "Чтение настроек камер",
-            self._details_worker,
-            rows,
-            self.default_username.get().strip(),
-            self.default_password.get(),
-            list(self.active_credential_rules),
-        )
-
-    def _details_worker(self, rows: list[dict], username: str, password: str, credential_rules: list) -> None:
-        self._read_details_rows(rows, username, password, credential_rules)
-        self.events.put(("done", f"Обновление данных завершено: камер {len(rows)}"))
-
-    def _run_vendor_discovery(
-        self,
-        timeout: float = 6.0,
-        sunell_only: bool = False,
-        interface_ip: str | None = None,
-    ) -> list[dict]:
-        scanner = APP_DIR / "esc_vendor_bulk.py"
-        output = APP_DIR / "vendor_camera_inventory_gui.csv"
-        command = [
-            sys.executable,
-            str(scanner),
-            "scan",
-            "--timeout",
-            str(timeout),
-            "--output",
-            str(output),
-        ]
-        if sunell_only:
-            command.extend(["--skip-onvif", "--skip-dynacolor", "--repeats", "2"])
-        if interface_ip is None:
-            interface_ip = self.interface_ip.get().strip()
-        if interface_ip:
-            command.extend(["--interface-ip", interface_ip])
-        completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if completed.stderr:
-            self.events.put(("log", completed.stderr))
-        if completed.returncode != 0:
-            raise RuntimeError(f"esc_vendor_bulk.py завершился с кодом {completed.returncode}")
-        with output.open(newline="", encoding="utf-8-sig") as stream:
-            return list(csv.DictReader(stream))
-
-    def _inventory_from_vendor_rows(self, vendor_rows) -> list[dict]:
-        found = []
-        for vendor_row in vendor_rows:
-            ip = vendor_row.get("current_ip", "")
-            if not ip:
-                continue
-            camera = self._camera_template_for_ip(ip)
-            model = vendor_row.get("model", "")
-            profile = self._profile_for_vendor_row(vendor_row, camera.get("profile", "cross"))
-            camera["profile"] = profile
-            found.append(
-                {
-                    "ip": ip,
-                    "assign": False,
-                    "new_ip": vendor_row.get("new_ip", ""),
-                    "model": model,
-                    "mac": vendor_row.get("mac", ""),
-                    "device_id": vendor_row.get("device_id", ""),
-                    "serial_number": vendor_row.get("serial_number", ""),
-                    "mask": vendor_row.get("mask", ""),
-                    "gateway_read": vendor_row.get("gateway", ""),
-                    "ntp_read": "",
-                    "timezone_read": "",
-                    "codec": "",
-                    "protocol": vendor_row.get("protocol", ""),
-                    "profile": profile,
-                    "status": vendor_row.get("protocol", "производитель"),
-                    "seen_passes": 0,
-                    "online": True,
-                    "camera": camera,
-                    "vendor_row": vendor_row,
-                }
-            )
-        return found
-
-    def _merge_inventory(self, found: list[dict]) -> None:
-        # A scan is a new observation. Previous observations live only in the history DB.
-        self.inventory = found
-        for row in self.inventory:
-            row["assign"] = False
-            row["new_ip"] = ""
-
-    @staticmethod
-    def _profile_for_vendor_row(vendor_row: dict, fallback: str = "cross") -> str:
-        protocol = vendor_row.get("protocol", "").lower()
-        model = vendor_row.get("model", "").lower()
-        if "sunell" in protocol:
-            return "cross"
-        if "/s8" in model or model.endswith("s8"):
-            return "apix_s8"
-        if "onvif" in protocol:
-            return "apix_e8"
-        return fallback
-
-    def build_address_plan(self) -> None:
-        if self.running:
-            return
-        if not self.inventory:
-            messagebox.showwarning("Список пуст", "Сначала выполните сканирование.")
-            return
-        try:
-            start = ipaddress.IPv4Address(self.target_start.get().strip())
-            end_text = self.target_end.get().strip()
-            if end_text:
-                end = ipaddress.IPv4Address(end_text)
-            else:
-                last_octet_capacity = 254 - int(str(start).split(".")[-1]) + 1
-                count = min(len(self.inventory), last_octet_capacity)
-                end = ipaddress.IPv4Address(int(start) + count - 1)
-            if int(end) < int(start):
-                raise ValueError("Конечный адрес пула меньше начального.")
-        except ValueError as exc:
-            messagebox.showerror("Ошибка пула", str(exc))
-            return
-        targets = [str(ipaddress.IPv4Address(value)) for value in range(int(start), int(end) + 1)]
-        selected_rows = [row for row in self._visible_rows() if row.get("assign")]
-        if not selected_rows:
-            messagebox.showwarning("Камеры не отмечены", "Отметьте камеры в колонке «Назначить».")
-            return
-        for row in self.inventory:
-            if not row.get("assign"):
-                row["new_ip"] = ""
-                continue
-            index = selected_rows.index(row)
-            row["new_ip"] = targets[index] if index < len(targets) else ""
-            row["status"] = "план готов" if row["new_ip"] else "пул закончился"
-        self._populate_table()
-        self.status.set(f"План: {min(len(targets), len(selected_rows))}/{len(selected_rows)}")
-
-    def export_inventory(self) -> None:
-        scope = self.export_scope.get()
-        if scope == "Весь текущий список":
-            rows = self.inventory
-        elif scope == "Отмеченные строки":
-            rows = [row for row in self._visible_rows() if row.get("assign")]
-        else:
-            rows = self._visible_rows()
-        if not rows:
-            messagebox.showwarning("Список пуст", "Нет строк для выбранного варианта выгрузки.")
-            return
-        path = filedialog.asksaveasfilename(title=f"Экспорт: {scope} ({len(rows)})",
-            initialdir=str(APP_DIR), initialfile=f"Камеры_{dt.datetime.now():%Y%m%d_%H%M}.xlsx",
-            defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")])
-        if not path:
-            return
-        try:
-            export_rows(path, rows, self.current_project_name, scope)
-        except Exception as exc:
-            messagebox.showerror("Экспорт не выполнен", str(exc))
-            return
-        self.status.set(f"Экспортировано строк: {len(rows)} — {pathlib.Path(path).name}")
-
-    def apply_address_plan(self) -> None:
-        if not self._prepare_credentials():
-            return
-        rows = [row for row in self._visible_rows() if row.get("assign") and row.get("new_ip")]
-        if not rows:
-            messagebox.showwarning("План не сформирован", "Сформируйте план назначения IP-адресов.")
-            return
-        default_rows = [row for row in rows if row.get("ip") == DEFAULT_CAMERA_IP]
-        if default_rows:
-            if len(default_rows) != len(rows):
-                messagebox.showerror(
-                    "Смешанный план",
-                    "Камеры с 192.168.0.250 назначаются отдельно от камер с уникальными IP-адресами.",
-                )
-                return
-            self.apply_default_ip_plan()
-            return
-        passes_text = self.pass_count.get()
-        passes = None if passes_text == "без ограничения" else int(passes_text)
-        preview = "\n".join(f"{row['ip']}  →  {row['new_ip']}" for row in rows[:8])
-        if len(rows) > 8:
-            preview += f"\n... ещё {len(rows) - 8}"
-        repeat_text = "до завершения" if passes is None else str(passes)
-        if not messagebox.askyesno(
-            "Подтверждение смены IP",
-            f"Прогонов: {repeat_text}\n\n{preview}\n\nОтправить команды смены IP?",
-        ):
-            return
-        self._start_worker("Назначение IP", self._address_worker, rows, passes)
-
-    def apply_default_ip_plan(self) -> None:
-        if self.running:
-            return
-        if not self._prepare_credentials():
-            return
-        rows = [
-            row
-            for row in self._visible_rows()
-            if row.get("assign") and row.get("new_ip") and row.get("ip") == DEFAULT_CAMERA_IP
-        ]
-        if not rows:
-            messagebox.showwarning(
-                "План не сформирован",
-                "Отметьте камеры с 192.168.0.250 и сформируйте для них план новых адресов.",
-            )
-            return
-        target_end_text = self.target_end.get().strip()
-        if target_end_text:
-            try:
-                target_end = ipaddress.IPv4Address(target_end_text)
-            except ipaddress.AddressValueError as exc:
-                messagebox.showerror("Ошибка пула", str(exc))
-                return
-            last_target = max(ipaddress.IPv4Address(row["new_ip"]) for row in rows)
-            template = rows[-1]
-            for value in range(int(last_target) + 1, int(target_end) + 1):
-                extra = copy.deepcopy(template)
-                extra["new_ip"] = str(ipaddress.IPv4Address(value))
-                extra["mac"] = ""
-                extra["device_id"] = ""
-                rows.append(extra)
-        targets = [row["new_ip"] for row in rows]
-        if len(targets) != len(set(targets)):
-            messagebox.showerror("Ошибка плана", "В плане назначения есть повторяющиеся новые IP-адреса.")
-            return
-        if DEFAULT_CAMERA_IP in targets:
-            messagebox.showerror("Ошибка плана", "Новый адрес не должен совпадать с 192.168.0.250.")
-            return
-        if not self.network_mask.get().strip() or not self.gateway.get().strip():
-            messagebox.showerror("Сеть не заполнена", "Укажите маску и шлюз для новых адресов.")
-            return
-
-        preview = "\n".join(f"192.168.0.250  →  {row['new_ip']}" for row in rows[:8])
-        if len(rows) > 8:
-            preview += f"\n... ещё {len(rows) - 8}"
-        if not messagebox.askyesno(
-            "Камеры с одинаковым IP",
-            f"Будет использовано адресов из пула: до {len(rows)}.\n"
-            "Команда отправляется той камере на 192.168.0.250, которая ответит первой. "
-            "После каждой смены программа сбросит ARP и дождётся ответа нового IP. "
-            "При первой ошибке обработка остановится.\n\n"
-            f"{preview}\n\nНачать?",
-        ):
-            return
-        self._start_worker(
-            "Проверка плана для 192.168.0.250",
-            self._default_ip_worker,
-            rows,
-        )
-
-    @staticmethod
-    def _is_admin() -> bool:
-        try:
-            import ctypes
-            return ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except Exception:
-            return False
-
-    @classmethod
-    def _flush_arp(cls, ip: str) -> bool:
-        startup = subprocess.STARTUPINFO()
-        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        success = False
-        try:
-            res = subprocess.run(
-                ["arp", "-d", ip],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                startupinfo=startup,
-                check=False,
-            )
-            if res.returncode == 0:
-                success = True
-        except Exception:
-            pass
-        try:
-            subprocess.run(
-                ["netsh", "interface", "ip", "delete", "arpcache"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                startupinfo=startup,
-                check=False,
-            )
-        except Exception:
-            pass
-        return success
-
-    @staticmethod
-    def _vendor_runtime_paths() -> tuple[pathlib.Path, pathlib.Path]:
-        bridge = APP_DIR / "vendor_bridge" / "VendorBridge.exe"
-        portable_vendor = APP_DIR / "vendor"
-        configured = os.environ.get("ESC_VENDOR_DIR", "").strip()
-        vendor_dir = portable_vendor if portable_vendor.is_dir() else pathlib.Path(
-            configured or r"C:\Program Files (x86)\ESC\lib\Starter"
-        )
-        return bridge, vendor_dir
-
-    def _send_targeted_sunell_ip(
-        self,
-        row: dict,
-        target_ip: str,
-        username: str,
-        password: str,
-        mask: str,
-        gateway: str,
-        dns: str,
-    ) -> tuple[bool, str]:
-        bridge, vendor_dir = self._vendor_runtime_paths()
-        if not bridge.exists():
-            return False, f"Не найден фирменный мост: {bridge}"
-        if not vendor_dir.is_dir():
-            return False, f"Не найдены DLL производителя: {vendor_dir}"
-        command = [
-            str(bridge),
-            "set-sunell",
-            DEFAULT_CAMERA_IP,
-            target_ip,
-            mask,
-            gateway,
-            dns,
-            row.get("model", ""),
-            row.get("mac", ""),
-            row.get("device_id", ""),
-            username,
-        ]
-        environment = dict(os.environ)
-        environment["ESC_VENDOR_DIR"] = str(vendor_dir)
-        startup = subprocess.STARTUPINFO()
-        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        try:
-            process = subprocess.run(
-                command,
-                input=password + "\n",
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=vendor_dir,
-                env=environment,
-                startupinfo=startup,
-            )
-        except subprocess.SubprocessError as exc:
-            return False, str(exc)
-        message = (process.stderr or process.stdout).strip()
-        return process.returncode == 0, message
-
-    def _identity_at_ip(
-        self,
-        expected_row: dict,
-        target_ip: str,
-        interface_ip: str,
-        timeout: float = 50.0,
-    ) -> tuple[bool, str]:
-        expected = camera_identity(expected_row)
-        deadline = time.monotonic() + timeout
-        last_message = "новый адрес не отвечает"
-        while time.monotonic() < deadline:
-            self._flush_arp(target_ip)
-            if not self._host_replies(target_ip):
-                time.sleep(2)
-                continue
-            last_message = "IP отвечает, но MAC/DeviceID еще не подтвержден"
-            try:
-                discovered = self._run_vendor_discovery(
-                    timeout=2.5,
-                    sunell_only=True,
-                    interface_ip=interface_ip,
-                )
-            except Exception as exc:
-                last_message = f"ошибка проверки производителя: {exc}"
-                time.sleep(2)
-                continue
-            for item in discovered:
-                if item.get("current_ip") == target_ip and camera_identity(item) == expected:
-                    return True, "MAC/DeviceID подтвержден"
-            time.sleep(2)
-        return False, last_message
-
-    def _discover_sunell_union(self, interface_ip: str, passes: int = 3) -> list[dict]:
-        found = {}
-        for pass_number in range(1, passes + 1):
-            self.events.put(("status", f"Проверка исходных камер: проход {pass_number}/{passes}"))
-            rows = self._run_vendor_discovery(
-                timeout=3.0,
-                sunell_only=True,
-                interface_ip=interface_ip,
-            )
-            for row in rows:
-                found[camera_identity(row)] = row
-            if pass_number < passes:
-                time.sleep(1)
-        return list(found.values())
-
-    def _write_default_assignment_log(self, results: list[dict]) -> None:
-        fields = ["timestamp", "mac", "device_id", "source_ip", "target_ip", "status", "message"]
-        write_header = not DEFAULT_ASSIGNMENT_LOG.exists() or DEFAULT_ASSIGNMENT_LOG.stat().st_size == 0
-        with DEFAULT_ASSIGNMENT_LOG.open("a", newline="", encoding="utf-8-sig") as stream:
-            writer = csv.DictWriter(stream, fieldnames=fields)
-            if write_header:
-                writer.writeheader()
-            writer.writerows(results)
-
-    def _default_ip_worker(
-        self,
-        rows: list[dict],
-    ) -> None:
+    def _default_ip_worker(self, rows: list[dict]) -> None:
         results = []
         targets = [row["new_ip"] for row in rows]
         occupied = self._check_target_pool(targets)
         if self.cancel_requested.is_set():
-            self.events.put(("done", "Проверка плана остановлена; команды смены IP не отправлялись"))
+            self.events.put(("done", "Проверка плана остановлена."))
             return
-        skipped = len(occupied)
-        if occupied:
-            self.events.put(("log", "Пропускаю занятые адреса: " + ", ".join(occupied) + "\n"))
-            occupied_set = set(occupied)
-            available = []
-            for row in rows:
-                if row["new_ip"] not in occupied_set:
-                    available.append(row)
-                    continue
+
+        occupied_set = set(occupied)
+        available = []
+        for row in rows:
+            if row["new_ip"] not in occupied_set:
+                available.append(row)
+            else:
                 results.append({"timestamp": dt.datetime.now().isoformat(timespec="seconds"),
                                 "mac": "", "device_id": "", "source_ip": DEFAULT_CAMERA_IP,
                                 "target_ip": row["new_ip"], "status": "skipped_occupied",
                                 "message": "Адрес занят; команда не отправлялась"})
                 row.update(status="целевой адрес занят — пропущен", assign=False, new_ip="")
-            rows = available
-            self.events.put(("refresh", None))
+
+        rows = available
+        self.events.put(("refresh", None))
         if not rows:
             self._write_default_assignment_log(results)
-            self.events.put(("done", f"В заданном пуле нет свободных адресов; пропущено {skipped}"))
+            self.events.put(("done", f"Все адреса в пуле заняты."))
             return
-        self.events.put(("log", f"Свободных адресов: {len(rows)}; занятых пропущено: {skipped}\n"))
-
-        if not self._is_admin():
-            self.events.put(("log", "⚠ Внимание: программа запущена без прав администратора. Сброс ARP-кэша Windows может быть заблокирован. Рекомендуется запускать через camera-gui.cmd от имени Администратора.\n"))
 
         completed = 0
         self._last_default_profile = None
         writer = QueueWriter(self.events)
         self.events.put(("progress", (0, len(rows))))
+
         for index, row in enumerate(rows, start=1):
             if self.cancel_requested.is_set():
                 break
             target_ip = row["new_ip"]
+
+            # Ожидание ответа камеры на 192.168.0.250 (до 120 сек)
+            self.events.put(("status", f"Камера {index}/{len(rows)}: ожидание появления {DEFAULT_CAMERA_IP}..."))
+            if not self._wait_for_default_ip(max_wait=120.0):
+                if self.cancel_requested.is_set():
+                    break
+                self.events.put(("log", f"  ⚠ 192.168.0.250 не отвечает (таймаут 120с). Ожидание завершено.\n"))
+                row["status"] = "192.168.0.250 не отвечает"
+                break
+
             result = {
                 "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
                 "mac": row.get("mac", ""),
@@ -1578,15 +1335,6 @@ class CameraGui(tk.Tk):
                 sent = self._apply_default_network_row(row)
 
             if not sent:
-                if row.get("status") == "целевой IP занят":
-                    skipped += 1
-                    result.update(status="skipped_occupied", message="Адрес оказался занят перед отправкой; пропущен")
-                    results.append(result)
-                    row.update(status="целевой адрес занят — пропущен", assign=False, new_ip="")
-                    self.events.put(("log", f"{target_ip} оказался занят; пропускаю\n"))
-                    self.events.put(("progress", (index, len(rows))))
-                    self.events.put(("refresh", None))
-                    continue
                 result["message"] = row.get("status", "команда отклонена")
                 results.append(result)
                 self.events.put(("log", f"  ✗ Не удалось отправить смену IP: {row.get('status')}\n"))
@@ -1601,9 +1349,8 @@ class CameraGui(tk.Tk):
             row["online"] = False
             row["status"] = "команда отправлена"
             row["last_seen"] = dt.datetime.now().isoformat(timespec="seconds")
-            row["camera"]["ip"] = target_ip
-            if row.get("vendor_row"):
-                row["vendor_row"]["current_ip"] = target_ip
+            if row.get("camera"):
+                row["camera"]["ip"] = target_ip
 
             result["status"] = "sent"
             result["message"] = "команда смены IP успешно отправлена"
@@ -1619,78 +1366,10 @@ class CameraGui(tk.Tk):
             self.cancel_requested.wait(3)
 
         self._write_default_assignment_log(results)
-
-        # Быстрая проверка доступности новых адресов в сети (не блокирует конвейер)
-        if completed > 0 and not self.cancel_requested.is_set():
-            self.events.put(("status", "Проверка доступности назначенных адресов в сети..."))
-            self.events.put(("log", "\nПроверка ответов новых IP-адресов...\n"))
-            for r in rows:
-                if r.get("status") == "команда отправлена" and r.get("ip"):
-                    check_ip = r["ip"]
-                    self._flush_arp(check_ip)
-                    if self._host_replies(check_ip):
-                        r["status"] = "новый IP отвечает"
-                        r["online"] = True
-                        self.events.put(("log", f"  ✓ {check_ip} онлайн\n"))
-                    else:
-                        r["status"] = "отправлено (перезагрузка)"
-            self.events.put(("refresh", None))
-
-        if self.cancel_requested.is_set():
-            message = f"Остановлено: отправлено {completed}/{len(rows)}; новые команды не отправляются"
-        else:
-            message = f"Назначение 192.168.0.250: отправлено {completed}/{len(rows)}"
-        if skipped:
-            message += f"; занятых адресов пропущено: {skipped}"
-        self.events.put(("done", message))
-
-    def _request_stop(self):
-        self.cancel_requested.set()
-        self.stop_button.configure(state="disabled")
-        self.status.set("Остановка: завершаю текущий запрос; отправленную смену IP сначала проверю")
-
-    def _check_target_pool(self, targets):
-        """Bound concurrent checks and publish progress before the first write."""
-        occupied = []
-        total = len(targets)
-        self.events.put(("progress", (0, total)))
-        self.events.put(("status", f"Проверка новых адресов: 0/{total}"))
-        self.events.put(("log", f"Проверяю {total} новых адресов, до 8 одновременно…\n"))
-        def check(ip):
-            if self.cancel_requested.is_set():
-                return False
-            self._flush_arp(ip)
-            return self._host_replies(ip)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            pending = {pool.submit(check, ip): ip for ip in targets}
-            for count, future in enumerate(concurrent.futures.as_completed(pending), 1):
-                ip = pending[future]
-                if future.result():
-                    occupied.append(ip)
-                self.events.put(("progress", (count, total)))
-                self.events.put(("status", f"Проверка новых адресов: {count}/{total}; занято: {len(occupied)}"))
-                if self.cancel_requested.is_set():
-                    for task in pending:
-                        task.cancel()
-                    break
-        return occupied
-
-    def _wait_for_default_ip(self, max_wait: float = 120.0) -> bool:
-        """Wait until DEFAULT_CAMERA_IP responds to ping, allowing cameras to boot or switch to update ARP."""
-        start = time.monotonic()
-        while not self.cancel_requested.is_set():
-            self._flush_arp(DEFAULT_CAMERA_IP)
-            if self._host_replies(DEFAULT_CAMERA_IP):
-                return True
-            elapsed = int(time.monotonic() - start)
-            if max_wait > 0 and elapsed >= max_wait:
-                return False
-            self.events.put(("status", f"Ожидание камеры на {DEFAULT_CAMERA_IP}... ({elapsed}с, нажмите «Остановить» для завершения)"))
-            self.cancel_requested.wait(2.0)
-        return False
+        msg = f"Назначение завершено: отправлено {completed}/{len(rows)}."
+        self.events.put(("done", msg))
 
     def _apply_default_network_row(self, row):
-        """Try supported methods on the default IP; prioritize targeted vendor protocol."""
         target = row["new_ip"]
         if self.cancel_requested.is_set():
             return False
@@ -1701,25 +1380,21 @@ class CameraGui(tk.Tk):
         config = self._runtime_config()
         config.setdefault("network", {})["ip_address"] = target
 
-        # 1. Приоритетный способ: если камера обнаружена по протоколу Sunell с MAC/DeviceID
+        # 1. Приоритетный способ: Sunell по MAC
         if (not self.cancel_requested.is_set() and row.get("protocol") == "sunell"
                 and row.get("mac") and row.get("device_id")):
             tz_val = config.get("timezone", {}).get("timezone")
             ntp_val = config.get("ntp", {}).get("server")
             if tz_val or ntp_val:
                 try:
-                    sunell_cam = copy.deepcopy(row["camera"])
+                    sunell_cam = copy.deepcopy(row.get("camera", row))
                     sunell_cam.update(ip=DEFAULT_CAMERA_IP, profile="cross")
                     sunell_drv = self._make_driver(sunell_cam, config)
                     if sunell_drv.connect():
-                        if tz_val:
-                            sunell_drv.apply_timezone()
-                        if ntp_val:
-                            sunell_drv.apply_ntp()
+                        if tz_val: sunell_drv.apply_timezone()
+                        if ntp_val: sunell_drv.apply_ntp()
                 except Exception:
                     pass
-            self.events.put(("status", f"{DEFAULT_CAMERA_IP} → {target}: фирменный метод Sunell (MAC {row.get('mac')})"))
-            print(f"  Приоритетный способ: фирменный метод Sunell по MAC {row.get('mac')}")
             username, password = self._credential_for_ip(DEFAULT_CAMERA_IP, self.active_credential_rules,
                                                         (self.default_username.get().strip(), self.default_password.get()))
             network = config["network"]
@@ -1727,11 +1402,9 @@ class CameraGui(tk.Tk):
                 network["subnet_mask"], network["gateway"], network.get("dns_main", ""))
             if sent:
                 row["status"] = "фирменная команда отправлена"
-                print(f"  ✓ Фирменная команда успешно отправлена на {row.get('mac')}")
                 return True
-            print(f"  Фирменный метод вернул ошибку ({message}); пробую веб-методы...")
 
-        # 2. Перебор HTTP-методов (CROSS, LAPI, CGI)
+        # 2. Перебор HTTP драйверов
         model = str(row.get("model", "")).lower()
         last_success = getattr(self, "_last_default_profile", None)
         preferred = last_success or ("apix_s8" if "/s8" in model else "apix_e8" if "/e8" in model else row.get("profile", "cross"))
@@ -1744,230 +1417,195 @@ class CameraGui(tk.Tk):
                 row["status"] = "остановлено до смены IP"
                 return False
             label = labels[profile]
-            self.events.put(("status", f"{DEFAULT_CAMERA_IP} → {target}: способ {index}/{len(profiles)} — {label}"))
-            print(f"  Способ {index}/{len(profiles)}: {label}")
-            camera = copy.deepcopy(row["camera"])
+            camera = copy.deepcopy(row.get("camera", row))
             camera.update(ip=DEFAULT_CAMERA_IP, profile=profile, network_autodetect=True)
             driver = self._make_driver(camera, config)
             try:
                 connected = driver.connect()
             except Exception as exc:
-                print(f"  Подключение {label}: {type(exc).__name__}")
                 continue
             if not connected or getattr(driver, "onvif_fallback", False):
-                print(f"  {label}: способ настройки сети не подтверждён; пробую следующий")
                 continue
             if self.cancel_requested.is_set():
                 row["status"] = "остановлено до смены IP"
                 return False
 
-            # Настройка часового пояса и NTP перед сменой сети
+            # Настройка времени и NTP до смены IP
             tz_val = config.get("timezone", {}).get("timezone")
             if tz_val:
-                try:
-                    self.events.put(("status", f"{DEFAULT_CAMERA_IP} → {target}: настройка часового пояса ({label})"))
-                    tz_ok = driver.apply_timezone()
-                    print(f"  Часовой пояс ({tz_val}): {'✓' if tz_ok else '✗'}")
-                except Exception as exc:
-                    print(f"  Часовой пояс: {exc}")
+                try: driver.apply_timezone()
+                except Exception: pass
 
             ntp_val = config.get("ntp", {}).get("server")
             if ntp_val:
-                try:
-                    self.events.put(("status", f"{DEFAULT_CAMERA_IP} → {target}: настройка NTP-сервера ({label})"))
-                    ntp_ok = driver.apply_ntp()
-                    print(f"  NTP-сервер ({ntp_val}): {'✓' if ntp_ok else '✗'}")
-                except Exception as exc:
-                    print(f"  NTP-сервер: {exc}")
+                try: driver.apply_ntp()
+                except Exception: pass
 
-            self.events.put(("status", f"{DEFAULT_CAMERA_IP} → {target}: отправка сети через {label}"))
+            # Опциональное применение видеопрофиля
+            if self.apply_video_profile.get():
+                try:
+                    p = profiles_mod.get_profile(self.selected_profile_key.get(), self.custom_profiles)
+                    config["streams"] = profiles_mod.profile_to_streams_config(p)
+                    driver.apply_streams()
+                except Exception:
+                    pass
+
             try:
                 sent = driver.apply_network()
             except configurator.requests.RequestException as exc:
                 response = getattr(exc, "response", None)
                 code = response.status_code if response is not None else None
                 if code in {400, 401, 403, 404, 405, 501}:
-                    print(f"  {label}: HTTP {code}; пробую следующий способ")
                     continue
                 row["status"] = f"{label}: команда отправлена"
-                print(f"  {label}: соединение сброшено после отправки (камера меняет IP)")
                 self._last_default_profile = profile
                 return True
             if sent:
                 self._last_default_profile = profile
                 row["profile"] = profile
-                row["camera"]["profile"] = profile
                 row["status"] = f"команда отправлена: {label}"
                 return True
-            code = getattr(driver, "network_http_status", None)
-            if code is not None and code >= 500 and code != 501:
-                row["status"] = f"{label}: команда отправлена"
-                self._last_default_profile = profile
-                return True
-            print(f"  {label}: команда отклонена; пробую следующий способ")
 
-        row["status"] = "остановлено" if self.cancel_requested.is_set() else "ни один способ настройки сети не подошёл"
-        print(f"{DEFAULT_CAMERA_IP} -> {target}: {row['status']}")
+        row["status"] = "ни один способ настройки сети не подошёл"
         return False
 
-    def _apply_network_row(self, row: dict) -> bool:
-        source_ip = row["ip"]
-        target_ip = row["new_ip"]
-        if source_ip != target_ip and self._host_replies(target_ip):
-            row["status"] = "целевой IP занят"
-            print(f"{source_ip} -> {target_ip}: целевой IP занят")
-            return False
-        camera = copy.deepcopy(row["camera"])
-        camera["ip"] = source_ip
-        config_data = self._runtime_config()
-        config_data.setdefault("network", {})["ip_address"] = target_ip
-        driver = self._make_driver(camera, config_data)
-        if not driver.connect():
-            row["status"] = "нет подключения"
-            print(f"{source_ip} -> {target_ip}: нет подключения")
-            return False
-        tz_val = config_data.get("timezone", {}).get("timezone")
-        if tz_val:
-            try:
-                driver.apply_timezone()
-            except Exception as exc:
-                print(f"  Часовой пояс: {exc}")
-        ntp_val = config_data.get("ntp", {}).get("server")
-        if ntp_val:
-            try:
-                driver.apply_ntp()
-            except Exception as exc:
-                print(f"  NTP-сервер: {exc}")
-        if not driver.apply_network():
-            row["status"] = "команда отклонена"
-            print(f"{source_ip} -> {target_ip}: команда отклонена")
-            return False
-        row["status"] = "команда отправлена"
-        print(f"{source_ip} -> {target_ip}: команда отправлена")
-        return True
-
-    def _address_worker(self, initial_rows: list[dict], passes: int | None) -> None:
-        writer = QueueWriter(self.events)
-        source_start = ipaddress.IPv4Address(self.scan_start.get().strip())
-        source_end_text = self.scan_end.get().strip()
-        source_end = ipaddress.IPv4Address(source_end_text) if source_end_text else source_start
-        target_start = ipaddress.IPv4Address(self.target_start.get().strip())
-        target_end_text = self.target_end.get().strip()
-        target_end = ipaddress.IPv4Address(target_end_text) if target_end_text else ipaddress.IPv4Address(
-            (int(target_start) & ~255) + 254
-        )
-        used_targets = {row["new_ip"] for row in initial_rows}
-        next_target_value = max(int(ipaddress.IPv4Address(value)) for value in used_targets) + 1
-        pending_rows = initial_rows
-        pass_number = 0
-        successful = 0
-
-        with redirect_stdout(writer), redirect_stderr(writer):
-            while pending_rows and (passes is None or pass_number < passes):
-                pass_number += 1
-                print(f"\nПрогон {pass_number}: камер {len(pending_rows)}")
-                pass_success = 0
-                for row in pending_rows:
-                    try:
-                        if self._apply_network_row(row):
-                            pass_success += 1
-                            successful += 1
-                    except Exception as exc:
-                        row["status"] = f"ошибка: {exc}"
-                        print(f"{row['ip']} -> {row['new_ip']}: {exc}")
-                self.events.put(("refresh", None))
-
-                if passes is not None and pass_number >= passes:
-                    break
-                if pass_success == 0:
-                    print("Нет успешных команд; повторение остановлено.")
-                    break
-
-                print("Ожидание 15 секунд перед повторным поиском дублей...")
-                time.sleep(15)
-                source_ips = [
-                    str(ipaddress.IPv4Address(value))
-                    for value in range(int(source_start), int(source_end) + 1)
-                ]
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, max(1, len(source_ips)))) as pool:
-                    remaining_sources = [ip for ip, alive in zip(source_ips, pool.map(self._host_replies, source_ips)) if alive]
-                if not remaining_sources:
-                    print("Исходный диапазон пуст; дубли не обнаружены.")
-                    break
-
-                pending_rows = []
-                for source_ip in remaining_sources:
-                    while next_target_value <= int(target_end):
-                        candidate = str(ipaddress.IPv4Address(next_target_value))
-                        next_target_value += 1
-                        if candidate not in used_targets:
-                            break
-                    else:
-                        print("Пул назначения закончился.")
-                        pending_rows = []
-                        break
-                    used_targets.add(candidate)
-                    source_row = next((row for row in self.inventory if row.get("ip") == source_ip), None)
-                    camera = copy.deepcopy(source_row["camera"]) if source_row else self._camera_template_for_ip(source_ip)
-                    row = {
-                        "ip": source_ip,
-                        "assign": True,
-                        "new_ip": candidate,
-                        "model": source_row.get("model", "") if source_row else camera.get("model", ""),
-                        "mac": source_row.get("mac", "") if source_row else camera.get("mac", ""),
-                        "profile": camera.get("profile", "cross"),
-                        "status": "повторный прогон",
-                        "camera": camera,
-                        "vendor_row": None,
-                    }
-                    self.inventory.append(row)
-                    pending_rows.append(row)
-                self.events.put(("refresh", None))
-
-        self.events.put(("done", f"Команд смены IP выполнено: {successful}"))
-
-    def _selected_operations(self) -> list[tuple[str, str, str]]:
-        return [operation for operation in OPERATIONS if self.operation_vars[operation[0]].get()]
-
-    def test_selected(self) -> None:
-        if not self._prepare_credentials():
-            return
-        cameras = self.selected_cameras()
-        if not cameras:
-            messagebox.showwarning("Камеры не выбраны", "Выберите хотя бы одну камеру.")
-            return
-        self._start_worker("Проверка подключения", self._test_worker, cameras)
+    # =========================================================================
+    # PARALLEL BATCH OPERATIONS FOR INDEPENDENT CAMERAS
+    # =========================================================================
 
     def apply_selected(self) -> None:
-        if not self._prepare_credentials():
+        if self.running:
             return
-        cameras = self.selected_cameras()
-        operations = self._selected_operations()
-        if not cameras:
-            messagebox.showwarning("Камеры не выбраны", "Выберите хотя бы одну камеру.")
+        selected = [r for r in self._visible_rows() if r.get("assign")]
+        if not selected:
+            messagebox.showwarning("Выбор", "Отметьте камеры для применения настроек (колонка «Назначить»).")
             return
-        if not operations:
-            messagebox.showwarning("Разделы не выбраны", "Выберите хотя бы один раздел настроек.")
+
+        config_data = self._runtime_config()
+        if self.apply_video_profile.get():
+            p = profiles_mod.get_profile(self.selected_profile_key.get(), self.custom_profiles)
+            config_data["streams"] = profiles_mod.profile_to_streams_config(p)
+
+        self._start_worker("Применение настроек", self._batch_apply_worker, selected, config_data)
+
+    def _batch_apply_worker(self, rows: list[dict], config_data: dict) -> None:
+        total = len(rows)
+        self.events.put(("progress", (0, total)))
+        self.events.put(("log", f"\n=== Пакетное применение настроек ({total} камер) ===\n"))
+
+        def process_camera(row):
+            if self.cancel_requested.is_set():
+                return
+            ip = row.get("ip")
+            cam_obj = copy.deepcopy(row.get("camera", row))
+            cam_obj["ip"] = ip
+            driver = self._make_driver(cam_obj, config_data)
+
+            self.events.put(("status", f"Подключение к {ip}..."))
+            try:
+                if not driver.connect():
+                    row["status"] = "ошибка подключения"
+                    self.events.put(("log", f"[{ip}] ✗ Не удалось подключиться\n"))
+                    return
+                # Time & NTP
+                if config_data.get("timezone"): driver.apply_timezone()
+                if config_data.get("ntp", {}).get("server"): driver.apply_ntp()
+                if self.apply_video_profile.get(): driver.apply_streams()
+                row["status"] = "настройки применены"
+                self.events.put(("log", f"[{ip}] ✓ Настройки успешно обновлены\n"))
+            except Exception as exc:
+                row["status"] = f"ошибка: {exc}"
+                self.events.put(("log", f"[{ip}] ✗ Ошибка: {exc}\n"))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            futures = [pool.submit(process_camera, r) for r in rows]
+            for i, f in enumerate(concurrent.futures.as_completed(futures), 1):
+                self.events.put(("progress", (i, total)))
+                self.events.put(("refresh", None))
+
+        self.events.put(("done", f"Обработка завершена для {total} камер."))
+
+    def read_selected_details(self) -> None:
+        selected = [r for r in self._visible_rows() if r.get("assign")]
+        if not selected:
+            messagebox.showwarning("Выбор", "Отметьте камеры для чтения настроек.")
             return
-        if any(key == "network" for key, _label, _method in operations) and len(cameras) > 1:
-            messagebox.showerror(
-                "Массовая смена сети заблокирована",
-                "В YAML задан один общий IP-адрес. Для смены сети выберите только одну камеру.",
-            )
+
+        def worker():
+            total = len(selected)
+            self.events.put(("progress", (0, total)))
+            self.events.put(("log", f"\n=== Чтение подробных настроек ({total} камер) ===\n"))
+            for i, r in enumerate(selected, 1):
+                if self.cancel_requested.is_set(): break
+                ip = r.get("ip")
+                u, p = self._credential_for_ip(ip, self.active_credential_rules, (self.default_username.get().strip(), self.default_password.get()))
+                self.events.put(("status", f"Чтение {i}/{total}: {ip}..."))
+                try:
+                    res = read_camera_settings(ip, u, p)
+                    if res:
+                        r.update({k: v for k, v in res.items() if v})
+                        r["status"] = "настройки прочитаны"
+                        self.events.put(("log", f"[{ip}] ✓ Настройки прочитаны (кодек: {r.get('codec','?')})\n"))
+                except Exception as exc:
+                    self.events.put(("log", f"[{ip}] ✗ Ошибка чтения: {exc}\n"))
+                self.events.put(("progress", (i, total)))
+                self.events.put(("refresh", None))
+            self.events.put(("done", f"Чтение настроек завершено ({total} камер)."))
+
+        self._start_worker("Чтение настроек", worker)
+
+    def check_selected_ping(self) -> None:
+        selected = [r for r in self._visible_rows() if r.get("assign")] or self._visible_rows()
+        if not selected:
             return
-        labels = ", ".join(label for _key, label, _method in operations)
-        confirmation_values = []
-        if any(key == "ntp" for key, _label, _method in operations):
-            confirmation_values.append(f"NTP-сервер: {self.ntp_server.get().strip() or 'НЕ ЗАДАН'}")
-        if any(key == "timezone" for key, _label, _method in operations):
-            confirmation_values.append(f"Часовой пояс: {self.cross_timezone.get().strip() or 'НЕ ЗАДАН'}")
-        values_text = "\n".join(confirmation_values)
-        if not messagebox.askyesno(
-            "Подтверждение",
-            f"Применить разделы «{labels}» к камерам: {len(cameras)}?\n\n{values_text}",
-        ):
-            return
-        self._start_worker("Применение настроек", self._apply_worker, cameras, operations)
+
+        def worker():
+            total = len(selected)
+            self.events.put(("progress", (0, total)))
+            for i, r in enumerate(selected, 1):
+                if self.cancel_requested.is_set(): break
+                ip = r.get("ip")
+                online = self._host_replies(ip)
+                r["online"] = online
+                r["status"] = "онлайн" if online else "не отвечает"
+                self.events.put(("progress", (i, total)))
+                self.events.put(("refresh", None))
+            self.events.put(("done", "Проверка доступности завершена."))
+
+        self._start_worker("Проверка доступности", worker)
+
+    def _read_single_camera_details(self) -> None:
+        row = self._get_active_row()
+        if not row: return
+        ip = row.get("ip")
+        u, p = self._credential_for_ip(ip, self.active_credential_rules, (self.default_username.get().strip(), self.default_password.get()))
+        def worker():
+            self.events.put(("log", f"\n[Чтение] Запрос настроек с {ip}...\n"))
+            try:
+                res = read_camera_settings(ip, u, p)
+                if res:
+                    row.update({k: v for k, v in res.items() if v})
+                    row["status"] = "настройки прочитаны"
+                    self.events.put(("log", f"[{ip}] ✓ Настройки успешно получены\n"))
+                    self.events.put(("refresh", None))
+            except Exception as e:
+                self.events.put(("log", f"[{ip}] ✗ Ошибка: {e}\n"))
+            self.events.put(("done", f"Чтение {ip} завершено"))
+        self._start_worker(f"Чтение {ip}", worker)
+
+    def _ping_single_camera(self) -> None:
+        row = self._get_active_row()
+        if not row: return
+        ip = row.get("ip")
+        online = self._host_replies(ip)
+        row["online"] = online
+        row["status"] = "онлайн" if online else "не отвечает"
+        self._render_table()
+        self.status.set(f"{ip}: {'Онлайн (отвечает)' if online else 'Недоступен (таймаут)'}")
+
+    # =========================================================================
+    # HELPERS & SYSTEM CALLS
+    # =========================================================================
 
     def _runtime_config(self) -> dict:
         data = copy.deepcopy(self.config_data)
@@ -1983,7 +1621,7 @@ class CameraGui(tk.Tk):
             offset = f"{sign}{hours}:{minutes}"
             timezone["timezone_offset"] = offset
             timezone["timezone_lapi"] = f"GMT{offset}"
-            # Для формата POSIX TZ (S8) знак инвертируется: восточнее GMT пишется с минусом (GMT+9 -> UTC-9, GMT+3 -> UTC-3)
+            # POSIX TZ (S8): GMT+9 -> UTC-9, GMT+3 -> UTC-3
             posix_sign = "-" if sign == "+" else "+"
             tz_min = f":{minutes}" if minutes != "00" else ""
             timezone["timezone_utc"] = f"UTC{posix_sign}{int(hours)}{tz_min}"
@@ -2010,151 +1648,287 @@ class CameraGui(tk.Tk):
             raise ValueError(f"Неизвестный драйвер: {profile.get('driver')}")
         return driver_class(profile, camera, config_data)
 
-    def _test_worker(self, cameras: list[dict]) -> None:
-        config_data = self._runtime_config()
-        success = 0
-        writer = QueueWriter(self.events)
-        with redirect_stdout(writer), redirect_stderr(writer):
-            for camera in cameras:
-                try:
-                    print(f"\n{camera['ip']}: проверка {camera.get('profile', 'cross')}")
-                    driver = self._make_driver(camera, config_data)
-                    if driver.connect():
-                        success += 1
-                        print("  OK")
-                    else:
-                        print("  ОШИБКА")
-                except Exception as exc:
-                    print(f"  ОШИБКА: {exc}")
-        self.events.put(("done", f"Подключение: {success}/{len(cameras)}"))
-
-    def _apply_worker(self, cameras: list[dict], operations: list[tuple[str, str, str]]) -> None:
-        config_data = self._runtime_config()
-        success = 0
-        writer = QueueWriter(self.events)
-        with redirect_stdout(writer), redirect_stderr(writer):
-            for camera in cameras:
-                camera_ok = True
-                try:
-                    print(f"\n{camera['ip']}: применение {camera.get('profile', 'cross')}")
-                    driver = self._make_driver(camera, config_data)
-                    if not driver.connect():
-                        print("  Подключение не выполнено")
-                        continue
-                    for _key, label, method_name in operations:
-                        print(f"  {label}...")
-                        if not bool(getattr(driver, method_name)()):
-                            camera_ok = False
-                    if camera_ok:
-                        success += 1
-                except Exception as exc:
-                    camera_ok = False
-                    print(f"  ОШИБКА: {exc}")
-                print("  OK" if camera_ok else "  НЕ ВЫПОЛНЕНО")
-        self.events.put(("done", f"Применено успешно: {success}/{len(cameras)}"))
-
-    def _start_worker(self, status: str, target, *args) -> None:
+    def _start_worker(self, title: str, func, *args):
         if self.running:
             return
-        self.running = True
+        self.btn_scan.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
         self.cancel_requested.clear()
-        self.status.set(status)
-        self.test_button.configure(state="disabled")
-        self.details_button.configure(state="disabled")
-        self.apply_button.configure(state="disabled")
-        self.address_button.configure(state="disabled")
-        self.default_ip_button.configure(state="disabled")
-        self.scan_button.configure(state="disabled")
-        self._lock_controls(True)
-        self.stop_button.configure(state="normal" if target.__name__ == "_default_ip_worker" else "disabled")
-        def worker():
-            try:
-                target(*args)
-            except Exception:
-                # Always restore controls, even if discovery fails unexpectedly.
-                self.events.put(("error", "Операция прервана ошибкой. Проверьте параметры подключения и повторите."))
-                self.events.put(("done", "Операция не завершена"))
-        threading.Thread(target=worker, daemon=True).start()
+        self.running = True
+        self.status.set(f"{title}...")
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(10)
+        threading.Thread(target=func, args=args, daemon=True).start()
 
-    def _drain_events(self) -> None:
-        try:
-            while True:
-                event, value = self.events.get_nowait()
-                if event == "log":
-                    self.log.configure(state="normal")
-                    self.log.insert("end", value)
+    def _request_stop(self):
+        self.cancel_requested.set()
+        self.btn_stop.configure(state="disabled")
+        self.status.set("Остановка: завершаю текущие операции...")
+
+    def _drain_events(self):
+        while not self.events.empty():
+            kind, payload = self.events.get_nowait()
+            if kind == "status":
+                self.status.set(payload)
+            elif kind == "log":
+                self.log.insert("end", payload)
+                if self.autoscroll_log.get():
                     self.log.see("end")
-                    self.log.configure(state="disabled")
-                elif event == "done":
-                    self.running = False
-                    self._lock_controls(False)
-                    self.stop_button.configure(state="disabled")
-                    online = sum(1 for row in self.inventory if row.get("online"))
-                    self.status.set(f"{value}. Известно: {len(self.inventory)}, в сети: {online}")
-                    self.test_button.configure(state="normal")
-                    self.details_button.configure(state="normal")
-                    self.apply_button.configure(state="normal")
-                    self.address_button.configure(state="normal")
-                    self.default_ip_button.configure(state="normal")
-                    self.scan_button.configure(state="normal")
-                    self._save_current_project()
-                elif event == "inventory":
-                    self.inventory = value
-                    self._populate_table()
-                elif event == "inventory_merge":
-                    self._merge_inventory(value)
-                    self._populate_table()
-                    self._save_current_project()
-                elif event == "details":
-                    identity, details = value
-                    row = next((item for item in self.inventory if camera_identity(item) == identity), None)
-                    if row is not None:
-                        row.update(details)
-                        row["details_read_at"] = dt.datetime.now().isoformat(timespec="seconds")
-                        if details.get("details_status") == "failed":
-                            row["status"] = "в сети; настройки не прочитаны"
-                        elif details.get("details_status") == "partial":
-                            row["status"] = "в сети; данные прочитаны частично"
-                        else:
-                            row["status"] = "в сети; настройки прочитаны"
-                        self._populate_table()
-                elif event == "refresh":
-                    self._populate_table()
-                elif event == "status":
-                    self.status.set(value)
-                elif event == "progress":
-                    current, total = value
-                    self.progress_bar.configure(maximum=max(total, 1), value=current)
-                elif event == "error":
-                    messagebox.showerror("Операция не выполнена", value)
-                elif event == "video_ready":
-                    self.video_pending = False
-                    vlc, uri, username, password = value
-                    try:
-                        launch_video(vlc, uri, username, password)
-                        self.status.set("Видеопоток открыт в VLC")
-                    except Exception:
-                        messagebox.showerror("Видео", "Не удалось запустить VLC.")
-                elif event == "video_failed":
-                    self.video_pending = False
-                    vlc, ip, username, password = value
-                    uri = simpledialog.askstring("Видео", "Не удалось получить поток через ONVIF.\nПроверьте доступ к камере. Можно указать известный RTSP-адрес вручную:", parent=self)
-                    if uri:
-                        try:
-                            uri = camera_url(uri.strip(), ip, {"rtsp", "rtsps"})
-                            launch_video(vlc, uri, username, password)
-                        except Exception:
-                            messagebox.showerror("Видео", "Не удалось открыть RTSP-адрес в VLC.")
-        except queue.Empty:
+            elif kind == "progress":
+                cur, tot = payload
+                self.progress.configure(mode="determinate", maximum=tot, value=cur)
+            elif kind == "refresh":
+                self._render_table()
+            elif kind == "merge_scan":
+                self.inventory = payload
+                self._render_table()
+            elif kind == "done":
+                self.running = False
+                self.progress.stop()
+                self.progress.configure(mode="determinate", value=0)
+                self.btn_scan.configure(state="normal")
+                self.btn_stop.configure(state="disabled")
+                self.status.set(payload)
+                self._render_table()
+        self.after(50, self._drain_events)
+
+    def _on_close(self):
+        self.vlc_player.stop()
+        self._save_current_project()
+        self.destroy()
+
+    @staticmethod
+    def _is_admin() -> bool:
+        try:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            return False
+
+    @classmethod
+    def _flush_arp(cls, ip: str) -> bool:
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        try:
+            subprocess.run(["arp", "-d", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=startup, check=False)
+            subprocess.run(["netsh", "interface", "ip", "delete", "arpcache"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=startup, check=False)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _host_replies(ip: str, timeout: float = 1.0) -> bool:
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        try:
+            res = subprocess.run(["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, startupinfo=startup, check=False)
+            return b"TTL=" in res.stdout
+        except Exception:
+            return False
+
+    def _check_target_pool(self, targets):
+        occupied = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            pending = {pool.submit(self._host_replies, ip): ip for ip in targets}
+            for future in concurrent.futures.as_completed(pending):
+                if future.result():
+                    occupied.append(pending[future])
+        return occupied
+
+    def _write_default_assignment_log(self, results: list[dict]) -> None:
+        fields = ["timestamp", "mac", "device_id", "source_ip", "target_ip", "status", "message"]
+        write_header = not DEFAULT_ASSIGNMENT_LOG.exists() or DEFAULT_ASSIGNMENT_LOG.stat().st_size == 0
+        with DEFAULT_ASSIGNMENT_LOG.open("a", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(results)
+
+    def _send_targeted_sunell_ip(self, row, target_ip, username, password, mask, gateway, dns):
+        bridge = APP_DIR / "vendor_bridge" / "VendorBridge.exe"
+        vendor_dir = APP_DIR / "vendor"
+        if not bridge.exists() or not vendor_dir.is_dir():
+            return False, "VendorBridge не найден"
+        command = [str(bridge), "set-sunell", DEFAULT_CAMERA_IP, target_ip, mask, gateway, dns, row.get("model",""), row.get("mac",""), row.get("device_id",""), username]
+        env = dict(os.environ, ESC_VENDOR_DIR=str(vendor_dir))
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        try:
+            p = subprocess.run(command, input=password + "\n", capture_output=True, text=True, timeout=30, cwd=vendor_dir, env=env, startupinfo=startup)
+            return p.returncode == 0, (p.stderr or p.stdout).strip()
+        except Exception as e:
+            return False, str(e)
+
+    def _run_vendor_discovery(self, timeout=3.0, sunell_only=False, interface_ip=""):
+        output = APP_DIR / "vendor_camera_inventory_gui.csv"
+        cmd = [sys.executable, str(APP_DIR / "esc_vendor_bulk.py"), "--discover-only", "--timeout", str(timeout), "--output", str(output)]
+        if sunell_only: cmd.extend(["--skip-onvif", "--skip-dynacolor", "--repeats", "2"])
+        if interface_ip: cmd.extend(["--interface-ip", interface_ip])
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if output.is_file():
+            with output.open(newline="", encoding="utf-8-sig") as s:
+                return list(csv.DictReader(s))
+        return []
+
+    def _credential_for_ip(self, ip, rules, default):
+        for pattern, u, p in rules:
+            if re.search(pattern, ip):
+                return u, p
+        return default
+
+    def _profile_for_vendor_row(self, vr, fallback="cross"):
+        proto = vr.get("protocol","").lower()
+        model = vr.get("model","").lower()
+        if "sunell" in proto: return "cross"
+        if "/s8" in model or model.endswith("s8"): return "apix_s8"
+        if "onvif" in proto: return "apix_e8"
+        return fallback
+
+    def _camera_template_for_ip(self, ip):
+        return {"ip": ip, "username": self.default_username.get().strip(), "password": self.default_password.get(), "profile": "cross"}
+
+    # =========================================================================
+    # CONFIG & PROJECT STORE
+    # =========================================================================
+
+    def _load_config_file(self, path: pathlib.Path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self.config_data = yaml.safe_load(f) or {}
+            net = self.config_data.get("network", {})
+            if net.get("subnet_mask"): self.network_mask.set(net["subnet_mask"])
+            if net.get("gateway"): self.gateway.set(net["gateway"])
+            if net.get("dns_main"): self.dns_main.set(net["dns_main"])
+            ntp = self.config_data.get("ntp", {})
+            if ntp.get("server"): self.ntp_server.set(ntp["server"])
+            tz = self.config_data.get("timezone", {})
+            if tz.get("timezone"): self.cross_timezone.set(tz["timezone"])
+        except Exception:
             pass
-        self.after(100, self._drain_events)
 
+    def _load_projects(self):
+        names = self.store.list_projects()
+        if not names:
+            self.store.ensure_project("По умолчанию")
+            names = ["По умолчанию"]
+        self.project_box.configure(values=names)
+        self.project_name.set(names[0])
+        self._load_project(names[0])
 
-def main() -> int:
-    app = CameraGui()
-    app.mainloop()
-    return 0
+    def _load_project(self, name: str):
+        self.current_project_name = name
+        settings, _cameras = self.store.load_project(name)
+        if settings:
+            if "network_mask" in settings: self.network_mask.set(settings["network_mask"])
+            if "gateway" in settings: self.gateway.set(settings["gateway"])
+            if "dns_main" in settings: self.dns_main.set(settings["dns_main"])
+            if "ntp_server" in settings: self.ntp_server.set(settings["ntp_server"])
+            if "cross_timezone" in settings: self.cross_timezone.set(settings["cross_timezone"])
+            if "target_start" in settings: self.target_start.set(settings["target_start"])
+            if "target_end" in settings: self.target_end.set(settings["target_end"])
+        # Fast clean startup: table starts empty
+        self.inventory = []
+        self._render_table()
+        self.status.set(f"Объект «{name}» загружен. Нажмите «🔍 Поиск» для сканирования.")
+
+    def _save_current_project(self):
+        if self.current_project_name:
+            settings = {
+                "network_mask": self.network_mask.get(),
+                "gateway": self.gateway.get(),
+                "dns_main": self.dns_main.get(),
+                "ntp_server": self.ntp_server.get(),
+                "cross_timezone": self.cross_timezone.get(),
+                "target_start": self.target_start.get(),
+                "target_end": self.target_end.get(),
+                "default_username": self.default_username.get(),
+            }
+            self.store.save_project(self.current_project_name, settings, self.inventory)
+
+    def _project_changed(self, _event=None):
+        name = self.project_name.get().strip()
+        if name and name != self.current_project_name:
+            self._save_current_project()
+            self._load_project(name)
+
+    def _new_project(self):
+        name = simpledialog.askstring("Новый объект", "Введите название объекта:", parent=self)
+        if name and name.strip():
+            name = name.strip()
+            self._save_current_project()
+            self.store.ensure_project(name)
+            names = self.store.list_projects()
+            self.project_box.configure(values=names)
+            self.project_name.set(name)
+            self._load_project(name)
+
+    def _delete_project(self):
+        name = self.project_name.get().strip()
+        if name and messagebox.askyesno("Удалить", f"Удалить объект «{name}»?"):
+            self.store.delete_project(name)
+            self._load_projects()
+
+    def build_address_plan(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Формирование адресного плана")
+        dlg.geometry("450x360")
+        dlg.transient(self)
+        dlg.grab_set()
+
+        frame = ttk.Frame(dlg, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Начальный целевой IP:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=self.target_start, width=20).grid(row=0, column=1, sticky="w", pady=4)
+
+        ttk.Label(frame, text="Конечный целевой IP:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(frame, textvariable=self.target_end, width=20).grid(row=1, column=1, sticky="w", pady=4)
+
+        ttk.Separator(frame, orient="horizontal").grid(row=2, column=0, columnspan=2, sticky="ew", pady=10)
+
+        ttk.Checkbutton(frame, text="Применить видеопрофиль к камерам", variable=self.apply_video_profile).grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
+
+        ttk.Label(frame, text="Профиль видео:").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Combobox(frame, textvariable=self.selected_profile_key, values=[k for k, _ in profiles_mod.list_profile_items()], state="readonly", width=18).grid(row=4, column=1, sticky="w", pady=4)
+
+        def generate_plan():
+            try:
+                s = int(ipaddress.IPv4Address(self.target_start.get().strip()))
+                e = int(ipaddress.IPv4Address(self.target_end.get().strip()))
+                if e < s: raise ValueError("Конечный адрес меньше начального.")
+                targets = [str(ipaddress.IPv4Address(val)) for val in range(s, e + 1)]
+            except Exception as ex:
+                messagebox.showerror("Ошибка пула", str(ex))
+                return
+
+            assigned_rows = [r for r in self._visible_rows() if r.get("assign")]
+            if not assigned_rows:
+                assigned_rows = self._visible_rows()
+
+            for i, r in enumerate(assigned_rows):
+                r["assign"] = True
+                r["new_ip"] = targets[i] if i < len(targets) else ""
+            self._render_table()
+            dlg.destroy()
+            messagebox.showinfo("Адресный план", f"Сформирован план для {min(len(assigned_rows), len(targets))} камер.")
+
+        ttk.Button(frame, text="Применить план к таблице", command=generate_plan).grid(row=6, column=0, columnspan=2, pady=16)
+
+    def _export_dialog(self, fmt: str):
+        path = filedialog.asksaveasfilename(
+            title=f"Экспорт таблицы в {fmt.upper()}",
+            defaultextension=f".{fmt}",
+            filetypes=[(f"Файл {fmt.upper()}", f"*.{fmt}")],
+        )
+        if path:
+            rows = [r for r in self._visible_rows() if r.get("assign")] or self._visible_rows()
+            try:
+                export_rows(path, rows, self.current_project_name, "таблица")
+                messagebox.showinfo("Экспорт", f"Экспортировано {len(rows)} строк в {path}")
+            except Exception as e:
+                messagebox.showerror("Ошибка экспорта", str(e))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    app = CameraGui()
+    app.mainloop()

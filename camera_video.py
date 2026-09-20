@@ -30,7 +30,7 @@ def camera_url(value, ip, schemes):
     return urllib.parse.urlunsplit((parsed.scheme.lower(), host, parsed.path, parsed.query, ""))
 
 
-def stream_uri(ip, username, password):
+def stream_uri(ip, username, password, stream_index: int = 0):
     ipaddress.IPv4Address(ip)
     media_ns = "http://www.onvif.org/ver10/media/wsdl"
     device_ns = "http://www.onvif.org/ver10/device/wsdl"
@@ -63,9 +63,10 @@ def stream_uri(ip, username, password):
               if element.tag.rsplit("}", 1)[-1] == "Profiles" and element.get("token")]
     if not tokens:
         raise ValueError("Камера не вернула видеопрофили ONVIF.")
+    token_idx = stream_index if stream_index < len(tokens) else 0
     root = post(url, media_ns, "GetStreamUri", '<trt:GetStreamUri><trt:StreamSetup>'
                 '<tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>RTSP</tt:Protocol>'
-                '</tt:Transport></trt:StreamSetup><trt:ProfileToken>' + escape(tokens[0]) +
+                '</tt:Transport></trt:StreamSetup><trt:ProfileToken>' + escape(tokens[token_idx]) +
                 '</trt:ProfileToken></trt:GetStreamUri>')
     uri = next((e.text for e in root.iter() if e.tag.rsplit("}", 1)[-1] == "Uri" and e.text), None)
     if not uri:
